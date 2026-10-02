@@ -1,0 +1,8 @@
+build/
+# 実行時に exe の隣にできるもの
+RamDay.ini
+RamDay.log
+/imdisk.sys
+# リリース作業の一時ファイル
+release-notes.md
+*.zip

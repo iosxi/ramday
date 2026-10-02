@@ -1,0 +1,69 @@
+#pragma code_page(65001)
+#include <windows.h>
+#include "resource.h"
+
+LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
+// ツールチェーン既定の manifest と同じ言語にして置き換えさせる
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "ramday.manifest"
+
+LANGUAGE LANG_JAPANESE, SUBLANG_DEFAULT
+IDI_APP ICON "ramday.ico"
+
+// ImDisk の署名済みドライバ（無改変）。imdisk.sys が exe の隣に無ければここから書き出す
+IDR_IMDISK_SYS RCDATA "imdisk\\imdisk.sys"
+
+IDD_SETUP DIALOGEX 0, 0, 284, 262
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "RamDay — RAM ディスクの作成"
+FONT 9, "Yu Gothic UI", 400, 0, 0x80
+BEGIN
+    GROUPBOX        "RAM ディスク", -1, 7, 6, 270, 100
+    LTEXT           "ドライブ文字:", -1, 16, 22, 62, 10
+    COMBOBOX        IDC_DRIVE, 80, 20, 44, 200, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "最大容量:", -1, 16, 40, 62, 10
+    EDITTEXT        IDC_SIZE_EDIT, 80, 38, 56, 13, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
+    COMBOBOX        IDC_UNIT, 140, 38, 40, 100, CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "", IDC_MAXINFO, 186, 40, 86, 10
+    LTEXT           "最小容量は 0 バイト。書き込んだ分だけメモリを確保し、ファイルを消すと解放します。", -1, 16, 56, 256, 18
+    LTEXT           "ファイルシステム:", -1, 16, 84, 62, 10
+    COMBOBOX        IDC_FS, 80, 82, 56, 100, CBS_DROPDOWNLIST | WS_TABSTOP
+
+    GROUPBOX        "TEMP 環境変数", -1, 7, 112, 270, 124
+    AUTOCHECKBOX    "TEMP と TMP を RAM ディスクへ一時的に切り替える", IDC_TEMP_ON, 16, 126, 252, 11, WS_TABSTOP
+    LTEXT           "切り替え先:", IDC_TEMP_LABEL, 26, 144, 50, 10
+    EDITTEXT        IDC_TEMP_DIR, 80, 142, 188, 13, ES_AUTOHSCROLL | WS_TABSTOP
+    AUTOCHECKBOX    "ユーザー", IDC_TEMP_USER, 80, 160, 60, 11, WS_TABSTOP
+    AUTOCHECKBOX    "システム", IDC_TEMP_SYS, 144, 160, 60, 11, WS_TABSTOP
+    LTEXT           "現在の値（解放するときにこの値へ戻します）:", -1, 16, 178, 252, 10
+    LTEXT           "", IDC_CUR_USER, 24, 191, 246, 10, SS_PATHELLIPSIS
+    LTEXT           "", IDC_CUR_SYS, 24, 203, 246, 10, SS_PATHELLIPSIS
+    LTEXT           "（ユーザーとシステムの TEMP・TMP を、それぞれ元の値で控えます）", -1, 24, 217, 246, 10
+
+    DEFPUSHBUTTON   "開始", IDOK, 166, 242, 52, 15, WS_TABSTOP
+    PUSHBUTTON      "キャンセル", IDCANCEL, 224, 242, 52, 15, WS_TABSTOP
+END
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041104b0"
+        BEGIN
+            VALUE "CompanyName", "nekoryu"
+            VALUE "FileDescription", "RamDay（伸び縮みする RAM ディスク）"
+            VALUE "FileVersion", "1.0.0"
+            VALUE "ProductName", "RamDay"
+            VALUE "ProductVersion", "1.0.0"
+            VALUE "Comments", "使った分だけメモリを確保し、不要になれば解放する RAM ディスク"
+            VALUE "OriginalFilename", "RamDay.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0411, 1200
+    END
+END
