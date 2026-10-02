@@ -14,7 +14,12 @@
 #define IDC_CUR_SYS      215
 #define IDC_TEMP_LABEL   216
 #define IDC_MAXINFO      217
+#define IDC_STATUS       218
+#define IDC_START        219
+#define IDC_STOP         220
+#define IDC_CUR_LABEL    221
 
 #define IDM_STATUS       300
 #define IDM_OPEN         301
 #define IDM_RELEASE      302
+#define IDM_SETTINGS     303

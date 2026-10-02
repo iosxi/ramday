@@ -4,7 +4,7 @@
 //   ディスク本体は ImDisk の署名済みドライバ（imdisk.sys、無改変）が作る。
 //   その「プロキシ」型デバイスを共有メモリ経由でこのプロセスにつなぎ、読み書きを
 //   ここで受け持つ。中身は 64KB ブロック単位で、書かれたブロックだけメモリを
-//   コミットし、TRIM（ファイル削除時にファイルシステムが送る）で解放する。
+//   コミットし、TRIM と空きビットマップの回収で、要らなくなったブロックを返す。
 //
 // レジストリに残さないために:
 //   - ImDisk が未インストールなら、起動中だけドライバをサービス登録し、終了時に
@@ -12,7 +12,11 @@
 //   - TEMP/TMP の元の値は exe の隣の RamDay.ini に控え、解放時に書き戻す。
 //     異常終了しても、次回起動時（または -restore）に ini から戻す。
 //
-// コマンドライン（指定するとダイアログを出さずに開始する。自動化・検証用）:
+// プロセスは 2 つ:
+//   設定画面（引数なし、一般権限）: 設定の入力と状態の表示。「開始」でワーカーを管理者として起動する
+//   ワーカー（-worker、管理者）     : RAM ディスクを持ち、トレイに常駐する。状態を共有メモリで公開する
+//
+// コマンドライン（指定すると設定画面を出さずにワーカーを起動する。自動化・検証用）:
 //   RamDay.exe -d R -s 4G -fs NTFS [-temp R:\Temp | -notemp] [-scope both|user|system] [-quiet]
 //   RamDay.exe -release [-force]   動作中の RamDay を解放して終了させる
 //   RamDay.exe -restore            前回の異常終了の後始末（TEMP の復元など）だけ行う
@@ -22,6 +26,7 @@
 #include <shlobj.h>
 #include <commctrl.h>
 #include <dbt.h>
+#include <sddl.h>
 #include <wchar.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +39,8 @@
 #define WM_RELEASE_REQ (WM_APP + 2)       // wParam: 1 = 使用中でも強制
 #define TIMER_TIP      1
 #define TIP_MS         2000
+#define TIMER_STATUS   3
+#define STATUS_MS      500
 #define VOLUME_LABEL   L"RamDay"
 #define MIN_SIZE       (16ULL << 20)      // フォーマットできる最小限
 #define FAT32_MAX      (32ULL << 30)      // Windows の FAT32 フォーマットの上限
@@ -101,6 +108,7 @@ static HICON     g_iconLarge, g_iconSmall;
 static NOTIFYICONDATAW g_nid;
 static UINT      g_msgTaskbarCreated;
 static BOOL      g_quiet;                  // コマンドライン起動: 対話せずログだけ
+static BOOL      g_worker;                 // ワーカー（RAM ディスクを管理する管理者プロセス）として動いている
 static BOOL      g_ending;                 // サインアウト・シャットダウン中: 時間のかかる全体通知を省く
 static wchar_t   g_exeDir[MAX_PATH], g_iniPath[MAX_PATH], g_logPath[MAX_PATH];
 static ULONGLONG g_physTotal;
@@ -140,6 +148,10 @@ static void fail_msg(HWND owner, const wchar_t *what, DWORD err) {
     if (err) last_error_text(err, et, ARRAYSIZE(et));
     swprintf(text, ARRAYSIZE(text), L"%ls%ls%ls", what, err ? L"\n\n" : L"", et);
     applog(L"エラー: %ls", text);
+    if (g_worker) {                        // 設定画面が読んで表示する
+        WritePrivateProfileStringW(L"Status", L"LastError", text, g_iniPath);
+        WritePrivateProfileStringW(NULL, NULL, NULL, g_iniPath);
+    }
     if (!g_quiet) MessageBoxW(owner, text, APP_TITLE, MB_ICONERROR);
 }
 
@@ -1126,11 +1138,80 @@ static BOOL recover(void) {
     return TRUE;
 }
 
+// ---- ワーカーの状態の公開（設定画面が読む） ----
+//
+// ワーカー（管理者）が名前付き共有メモリに状態を書き、設定画面（一般権限）が読む。
+// 一般権限からも読めるよう、認証済みユーザーに読み取りを許す。
+
+enum { ST_STOPPED, ST_STARTING, ST_RUNNING, ST_STOPPING };
+typedef struct {
+    DWORD     cb;
+    LONG      state;
+    DWORD     pid;
+    ULONGLONG wnd;
+    LONG      fs, tempOn;
+    WCHAR     letter, pad[3];
+    ULONGLONG diskSize, used;
+    WCHAR     tempDir[MAX_PATH];
+} SharedStatus;
+#define STATUS_NAME L"Local\\RamDay_Status"
+
+static HANDLE        g_stMap;
+static SharedStatus *g_st;
+
+static void status_open(void) {
+    SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, FALSE };
+    ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;AU)",
+                                                         SDDL_REVISION_1, &sa.lpSecurityDescriptor, NULL);
+    g_stMap = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, sizeof(SharedStatus), STATUS_NAME);
+    if (sa.lpSecurityDescriptor) LocalFree(sa.lpSecurityDescriptor);
+    g_st = g_stMap ? MapViewOfFile(g_stMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedStatus)) : NULL;
+    if (g_st) {
+        ZeroMemory(g_st, sizeof *g_st);
+        g_st->cb = sizeof *g_st;
+        g_st->pid = GetCurrentProcessId();
+    }
+}
+
+// 状態の公開をやめる（設定画面からは「停止中」に見える）
+static void status_close(void) {
+    if (g_st) UnmapViewOfFile(g_st);
+    if (g_stMap) CloseHandle(g_stMap);
+    g_st = NULL;
+    g_stMap = NULL;
+}
+
+static void status_set(LONG state) {
+    if (!g_st) return;
+    g_st->wnd = (ULONGLONG)(ULONG_PTR)g_wnd;
+    g_st->letter = g_cfg.letter;
+    g_st->fs = g_cfg.fs;
+    g_st->tempOn = g_envChanged;
+    wcsncpy(g_st->tempDir, g_cfg.tempDir, MAX_PATH - 1);
+    g_st->diskSize = g_diskSize;
+    g_st->used = (ULONGLONG)g_usedBlk << BLK_SHIFT;
+    MemoryBarrier();
+    g_st->state = state;
+}
+
+// 設定画面側: 動いているワーカーの状態を読む。動いていなければ FALSE
+static BOOL status_read(SharedStatus *out) {
+    HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, STATUS_NAME);
+    if (!m) return FALSE;
+    SharedStatus *v = MapViewOfFile(m, FILE_MAP_READ, 0, 0, sizeof *v);
+    BOOL ok = v && v->cb == sizeof *v;
+    if (ok) *out = *v;
+    if (v) UnmapViewOfFile(v);
+    CloseHandle(m);
+    return ok;
+}
+
 // ---- 開始・解放 ----
 
 static BOOL g_running;
 
-static BOOL release_all(HWND owner, BOOL force) {
+// ask: 使用中なら強制してよいか本人に訊く（トレイから）。訊かないときは取りやめて FALSE
+static BOOL release_all(HWND owner, BOOL force, BOOL ask) {
     if (!g_running) return TRUE;
     wchar_t letter = g_cfg.letter;
     BOOL locked = FALSE;
@@ -1142,7 +1223,7 @@ static BOOL release_all(HWND owner, BOOL force) {
         log_stats(L"解放前");
         vol = volume_open_lock(letter, &locked);
         if (vol != INVALID_HANDLE_VALUE && !locked && !force) {
-            if (g_quiet || MessageBoxW(owner,
+            if (!ask || MessageBoxW(owner,
                     L"RAM ディスク上のファイルを使っているプログラムがあります。\n\n"
                     L"強制的に解放しますか？（保存していない内容は失われます）",
                     APP_TITLE, MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) {
@@ -1154,6 +1235,7 @@ static BOOL release_all(HWND owner, BOOL force) {
         }
         if (!locked) applog(L"ロックできないまま強制的に外す");
     }
+    status_set(ST_STOPPING);
     if (g_envChanged || ini_get_int(L"Backup", L"Active", 0)) env_restore();
     if (g_diskUp) disk_remove(letter, vol, locked);
     driver_cleanup();
@@ -1214,18 +1296,79 @@ static BOOL start_all(const Settings *s) {
     }
     return TRUE;
 fail:
-    release_all(NULL, TRUE);
+    release_all(NULL, TRUE, FALSE);
     return FALSE;
 }
 
-// ---- 設定ダイアログ ----
+// ---- 自分自身を起動する ----
 
-static void dlg_fill_drives(HWND dlg, wchar_t sel) {
+static BOOL is_elevated(void) {
+    HANDLE tok;
+    TOKEN_ELEVATION e = { 0 };
+    DWORD n;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return FALSE;
+    BOOL ok = GetTokenInformation(tok, TokenElevation, &e, sizeof e, &n);
+    CloseHandle(tok);
+    return ok && e.TokenIsElevated;
+}
+
+// 引数を付けて自分を起動する。elevate なら管理者として（必要なら UAC が出る）。
+// 成功すればプロセスのハンドルを返す。UAC で断られたら NULL（GetLastError = ERROR_CANCELLED）
+static HANDLE run_self(const wchar_t *args, BOOL elevate) {
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    SHELLEXECUTEINFOW sei = { .cbSize = sizeof sei };
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.lpVerb = elevate && !is_elevated() ? L"runas" : L"open";
+    sei.lpFile = exe;
+    sei.lpParameters = args;
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) return NULL;
+    return sei.hProcess;
+}
+
+// コマンドラインから exe の部分を除いた残り
+static const wchar_t *cmdline_args(void) {
+    const wchar_t *p = GetCommandLineW();
+    if (*p == L'"') {
+        p++;
+        while (*p && *p != L'"') p++;
+        if (*p) p++;
+    } else {
+        while (*p && *p != L' ' && *p != L'\t') p++;
+    }
+    while (*p == L' ' || *p == L'\t') p++;
+    return p;
+}
+
+static void worker_args(const Settings *s, wchar_t *buf, size_t n) {
+    wchar_t tmp[MAX_PATH + 64];
+    swprintf(buf, n, L"-worker -d %lc -s %llu%ls -fs %ls", s->letter, s->sizeNum, s->unitGB ? L"G" : L"M", FS_NAMES[s->fs]);
+    if (s->temp && (s->tempUser || s->tempSys)) {
+        swprintf(tmp, ARRAYSIZE(tmp), L" -temp \"%ls\" -scope %ls", s->tempDir,
+                 s->tempUser && s->tempSys ? L"both" : s->tempUser ? L"user" : L"system");
+    } else {
+        wcscpy(tmp, L" -notemp");
+    }
+    wcsncat(buf, tmp, n - wcslen(buf) - 1);
+}
+
+// ---- 設定画面 ----
+
+#define TIMER_UI     2
+#define UI_MS        500
+#define DLG_TITLE    L"RamDay — RAM ディスクの作成"
+
+static HANDLE  g_uiWorker;                 // 「開始」で起動したワーカー（起動中の見張り用）
+static LONG    g_uiShown = -1;             // 前回表示した状態
+
+static void dlg_fill_drives(HWND dlg, wchar_t sel, wchar_t include) {
     HWND cb = GetDlgItem(dlg, IDC_DRIVE);
+    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
     DWORD used = GetLogicalDrives();
     int selIdx = -1, lastFree = -1;
     for (wchar_t c = L'D'; c <= L'Z'; c++) {
-        if (used & (1u << (c - L'A'))) continue;
+        if ((used & (1u << (c - L'A'))) && c != include) continue;
         wchar_t t[4] = { c, L':', 0 };
         int i = (int)SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)t);
         SendMessageW(cb, CB_SETITEMDATA, i, c);
@@ -1241,15 +1384,195 @@ static wchar_t dlg_letter(HWND dlg) {
     return i < 0 ? 0 : (wchar_t)SendMessageW(cb, CB_GETITEMDATA, i, 0);
 }
 
-static void dlg_update_enable(HWND dlg) {
-    BOOL on = IsDlgButtonChecked(dlg, IDC_TEMP_ON) == BST_CHECKED;
+// 切り替え先が「X:\...」なら、選ばれているドライブ文字に付け替える
+static void dlg_sync_tempdir(HWND dlg) {
+    wchar_t nl = dlg_letter(dlg), td[MAX_PATH];
+    GetDlgItemTextW(dlg, IDC_TEMP_DIR, td, ARRAYSIZE(td));
+    if (nl && td[0] && td[1] == L':' && towupper(td[0]) != nl) {
+        td[0] = nl;
+        SetDlgItemTextW(dlg, IDC_TEMP_DIR, td);
+    }
+}
+
+// 設定を入力欄に並べる
+static void dlg_show_settings(HWND dlg, const Settings *c, wchar_t include) {
+    dlg_fill_drives(dlg, c->letter, include);
+    SetDlgItemInt(dlg, IDC_SIZE_EDIT, (UINT)c->sizeNum, FALSE);
+    SendDlgItemMessageW(dlg, IDC_UNIT, CB_SETCURSEL, c->unitGB ? 1 : 0, 0);
+    SendDlgItemMessageW(dlg, IDC_FS, CB_SETCURSEL, c->fs, 0);
+    CheckDlgButton(dlg, IDC_TEMP_ON, c->temp ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dlg, IDC_TEMP_USER, c->tempUser ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dlg, IDC_TEMP_SYS, c->tempSys ? BST_CHECKED : BST_UNCHECKED);
+    SetDlgItemTextW(dlg, IDC_TEMP_DIR, c->tempDir);
+    dlg_sync_tempdir(dlg);
+}
+
+// 動いているワーカーの設定（共有メモリ）を Settings にする。TEMP の対象（ユーザー/システム）は ini の控えから
+static void settings_from_status(const SharedStatus *st, Settings *c) {
+    *c = g_cfg;
+    c->letter = st->letter;
+    c->fs = (st->fs >= 0 && st->fs < FS_COUNT) ? st->fs : FS_NTFS;
+    BOOL gb = st->diskSize && !(st->diskSize & ((1ULL << 30) - 1));
+    c->unitGB = gb;
+    c->sizeNum = st->diskSize >> (gb ? 30 : 20);
+    c->temp = st->tempOn;
+    if (st->tempOn) {
+        wcsncpy(c->tempDir, st->tempDir, MAX_PATH - 1);
+        c->tempUser = ini_get_int(L"Backup", L"UserTEMPType", 99) != 99;
+        c->tempSys = ini_get_int(L"Backup", L"SystemTEMPType", 99) != 99;
+    }
+}
+
+// 入力欄の有効・無効。動いている間は設定を変えられない
+static void dlg_update_enable(HWND dlg, BOOL editable) {
+    static const int fields[] = { IDC_DRIVE, IDC_SIZE_EDIT, IDC_UNIT, IDC_FS, IDC_TEMP_ON };
+    for (size_t i = 0; i < ARRAYSIZE(fields); i++) EnableWindow(GetDlgItem(dlg, fields[i]), editable);
+    BOOL on = editable && IsDlgButtonChecked(dlg, IDC_TEMP_ON) == BST_CHECKED;
     EnableWindow(GetDlgItem(dlg, IDC_TEMP_DIR), on);
     EnableWindow(GetDlgItem(dlg, IDC_TEMP_USER), on);
     EnableWindow(GetDlgItem(dlg, IDC_TEMP_SYS), on);
     EnableWindow(GetDlgItem(dlg, IDC_TEMP_LABEL), on);
 }
 
-static wchar_t g_dlgPrevLetter;
+static void set_text_if_changed(HWND dlg, int id, const wchar_t *text) {
+    wchar_t cur[2100];
+    GetDlgItemTextW(dlg, id, cur, ARRAYSIZE(cur));
+    if (wcscmp(cur, text)) SetDlgItemTextW(dlg, id, text);
+}
+
+static void ui_refresh(HWND dlg) {
+    SharedStatus st;
+    BOOL alive = status_read(&st);
+    LONG state = alive ? st.state : ST_STOPPED;
+    // 起動したワーカーが状態を公開する前、または失敗して終わったとき
+    if (g_uiWorker) {
+        DWORD code;
+        if (GetExitCodeProcess(g_uiWorker, &code) && code != STILL_ACTIVE) {
+            CloseHandle(g_uiWorker);
+            g_uiWorker = NULL;
+            if (code != 0) {
+                wchar_t err[1024];
+                ini_get(L"Status", L"LastError", L"", err, ARRAYSIZE(err));
+                if (!err[0]) swprintf(err, ARRAYSIZE(err), L"RAM ディスクを開始できませんでした（終了コード %lu）。", code);
+                MessageBoxW(dlg, err, APP_TITLE, MB_ICONERROR);
+            }
+        } else if (!alive || state == ST_STARTING) {
+            state = ST_STARTING;
+        } else {
+            CloseHandle(g_uiWorker);       // 動き出したので見張りは終わり
+            g_uiWorker = NULL;
+        }
+    }
+
+    wchar_t text[300], u[32], mx[32];
+    switch (state) {
+    case ST_STARTING: wcscpy(text, L"開始しています…"); break;
+    case ST_STOPPING: wcscpy(text, L"終了しています…"); break;
+    case ST_RUNNING:
+        format_bytes(st.used, u, ARRAYSIZE(u));
+        format_bytes(st.diskSize, mx, ARRAYSIZE(mx));
+        swprintf(text, ARRAYSIZE(text), L"動作中 — %lc:（%ls）　メモリ使用 %ls / 最大 %ls",
+                 st.letter, (st.fs >= 0 && st.fs < FS_COUNT) ? FS_NAMES[st.fs] : L"?", u, mx);
+        break;
+    default: wcscpy(text, L"停止中"); break;
+    }
+    set_text_if_changed(dlg, IDC_STATUS, text);
+
+    wchar_t d[2100];
+    env_describe(FALSE, d, ARRAYSIZE(d));
+    set_text_if_changed(dlg, IDC_CUR_USER, d);
+    env_describe(TRUE, d, ARRAYSIZE(d));
+    set_text_if_changed(dlg, IDC_CUR_SYS, d);
+    set_text_if_changed(dlg, IDC_CUR_LABEL, state == ST_RUNNING && st.tempOn
+                        ? L"現在の値（RamDay が切り替え中。終了すると元の値に戻ります）:"
+                        : L"現在の値（開始すると控えて、終了するときにこの値へ戻します）:");
+
+    if (state != g_uiShown) {
+        BOOL stopped = state == ST_STOPPED;
+        if (state == ST_RUNNING) {         // 動いている RAM ディスクの設定を見せる
+            Settings c;
+            settings_from_status(&st, &c);
+            dlg_show_settings(dlg, &c, c.letter);
+        } else if (stopped && g_uiShown != -1) {   // 止まったら次に開始する設定（ini）に戻す
+            dlg_show_settings(dlg, &g_cfg, 0);
+        }
+        dlg_update_enable(dlg, stopped);
+        EnableWindow(GetDlgItem(dlg, IDC_START), stopped);
+        EnableWindow(GetDlgItem(dlg, IDC_STOP), state == ST_RUNNING);
+        SendMessageW(dlg, DM_SETDEFID, stopped ? IDC_START : IDCANCEL, 0);
+        g_uiShown = state;
+    }
+}
+
+static BOOL dlg_collect(HWND dlg, Settings *out) {
+    Settings s = g_cfg;
+    BOOL ok;
+    s.letter = dlg_letter(dlg);
+    s.sizeNum = GetDlgItemInt(dlg, IDC_SIZE_EDIT, &ok, FALSE);
+    s.unitGB = SendDlgItemMessageW(dlg, IDC_UNIT, CB_GETCURSEL, 0, 0) == 1;
+    s.fs = (int)SendDlgItemMessageW(dlg, IDC_FS, CB_GETCURSEL, 0, 0);
+    s.temp = IsDlgButtonChecked(dlg, IDC_TEMP_ON) == BST_CHECKED;
+    s.tempUser = IsDlgButtonChecked(dlg, IDC_TEMP_USER) == BST_CHECKED;
+    s.tempSys = IsDlgButtonChecked(dlg, IDC_TEMP_SYS) == BST_CHECKED;
+    GetDlgItemTextW(dlg, IDC_TEMP_DIR, s.tempDir, ARRAYSIZE(s.tempDir));
+    ULONGLONG bytes = cfg_bytes(&s);
+    const wchar_t *bad = NULL;
+    wchar_t m[200];
+    if (!s.letter) bad = L"ドライブ文字を選んでください。";
+    else if (!ok || bytes < MIN_SIZE) bad = L"最大容量は 16 MB 以上にしてください。";
+    else if (bytes > g_physTotal) {
+        format_bytes(g_physTotal, m + 100, 100);
+        swprintf(m, 100, L"最大容量は実メモリ（%ls）以下にしてください。", m + 100);
+        bad = m;
+    } else if (s.fs == FS_FAT32 && bytes > FAT32_MAX)
+        bad = L"FAT32 は 32 GB までです。exFAT か NTFS を選んでください。";
+    else if (s.temp && (s.tempUser || s.tempSys) &&
+             (towupper(s.tempDir[0]) != s.letter || s.tempDir[1] != L':' || s.tempDir[2] != L'\\'))
+        bad = L"TEMP の切り替え先は、作る RAM ディスク上のフォルダー（例: R:\\Temp）にしてください。";
+    if (bad) {
+        MessageBoxW(dlg, bad, APP_TITLE, MB_ICONWARNING);
+        return FALSE;
+    }
+    s.tempDir[0] = s.letter;
+    *out = s;
+    return TRUE;
+}
+
+static void ui_start(HWND dlg) {
+    Settings s;
+    if (!dlg_collect(dlg, &s)) return;
+    g_cfg = s;
+    settings_save(&g_cfg);
+    ini_put(L"Status", L"LastError", NULL);
+    ini_flush();
+    wchar_t args[MAX_PATH + 128];
+    worker_args(&g_cfg, args, ARRAYSIZE(args));
+    HANDLE p = run_self(args, TRUE);
+    if (!p) {
+        DWORD e = GetLastError();
+        if (e != ERROR_CANCELLED) fail_msg(dlg, L"RAM ディスクを管理するプロセスを起動できませんでした。", e);
+        return;
+    }
+    g_uiWorker = p;
+    ui_refresh(dlg);
+}
+
+static void ui_stop(HWND dlg) {
+    SharedStatus st;
+    if (!status_read(&st) || st.state != ST_RUNNING) return;
+    HWND w = (HWND)(ULONG_PTR)st.wnd;
+    HCURSOR old = SetCursor(LoadCursor(NULL, IDC_WAIT));
+    DWORD_PTR done = 0;
+    BOOL sent = SendMessageTimeoutW(w, WM_RELEASE_REQ, 0, 0, SMTO_ABORTIFHUNG, 60000, &done);
+    if (sent && !done &&
+        MessageBoxW(dlg, L"RAM ディスク上のファイルを使っているプログラムがあります。\n\n"
+                         L"強制的に終了しますか？（保存していない内容は失われます）",
+                    APP_TITLE, MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES)
+        sent = SendMessageTimeoutW(w, WM_RELEASE_REQ, 1, 0, SMTO_ABORTIFHUNG, 60000, &done);
+    SetCursor(old);
+    if (!sent) fail_msg(dlg, L"RAM ディスクを管理するプロセスが応答しません。", GetLastError());
+    ui_refresh(dlg);
+}
 
 static INT_PTR CALLBACK setup_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
     (void)lp;
@@ -1257,89 +1580,41 @@ static INT_PTR CALLBACK setup_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_INITDIALOG: {
         SendMessageW(dlg, WM_SETICON, ICON_BIG, (LPARAM)g_iconLarge);
         SendMessageW(dlg, WM_SETICON, ICON_SMALL, (LPARAM)g_iconSmall);
-        dlg_fill_drives(dlg, g_cfg.letter);
-        g_dlgPrevLetter = dlg_letter(dlg);
-        SetDlgItemInt(dlg, IDC_SIZE_EDIT, (UINT)g_cfg.sizeNum, FALSE);
         SendDlgItemMessageW(dlg, IDC_SIZE_EDIT, EM_LIMITTEXT, 7, 0);
         HWND u = GetDlgItem(dlg, IDC_UNIT);
         SendMessageW(u, CB_ADDSTRING, 0, (LPARAM)L"MB");
         SendMessageW(u, CB_ADDSTRING, 0, (LPARAM)L"GB");
-        SendMessageW(u, CB_SETCURSEL, g_cfg.unitGB ? 1 : 0, 0);
         HWND f = GetDlgItem(dlg, IDC_FS);
         for (int i = 0; i < FS_COUNT; i++) SendMessageW(f, CB_ADDSTRING, 0, (LPARAM)FS_NAMES[i]);
-        SendMessageW(f, CB_SETCURSEL, g_cfg.fs, 0);
+        dlg_show_settings(dlg, &g_cfg, 0);
         wchar_t ram[32], info[64];
         format_bytes(g_physTotal, ram, ARRAYSIZE(ram));
         swprintf(info, ARRAYSIZE(info), L"（実メモリ %ls）", ram);
         SetDlgItemTextW(dlg, IDC_MAXINFO, info);
-        CheckDlgButton(dlg, IDC_TEMP_ON, g_cfg.temp ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(dlg, IDC_TEMP_USER, g_cfg.tempUser ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(dlg, IDC_TEMP_SYS, g_cfg.tempSys ? BST_CHECKED : BST_UNCHECKED);
-        wchar_t td[MAX_PATH];
-        wcscpy(td, g_cfg.tempDir);
-        if (td[0] && td[1] == L':') td[0] = g_dlgPrevLetter;   // ドライブ文字は選んだものに合わせる
-        SetDlgItemTextW(dlg, IDC_TEMP_DIR, td);
-        wchar_t d[2100];
-        env_describe(FALSE, d, ARRAYSIZE(d));
-        SetDlgItemTextW(dlg, IDC_CUR_USER, d);
-        env_describe(TRUE, d, ARRAYSIZE(d));
-        SetDlgItemTextW(dlg, IDC_CUR_SYS, d);
-        dlg_update_enable(dlg);
+        g_uiShown = -1;
+        ui_refresh(dlg);
+        SetTimer(dlg, TIMER_UI, UI_MS, NULL);
         return TRUE;
     }
+    case WM_TIMER:
+        if (wp == TIMER_UI) ui_refresh(dlg);
+        return TRUE;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDC_TEMP_ON:
-            dlg_update_enable(dlg);
+            dlg_update_enable(dlg, TRUE);
             return TRUE;
         case IDC_DRIVE:
-            if (HIWORD(wp) == CBN_SELCHANGE) {
-                // 切り替え先が前のドライブ文字のままなら、新しい文字に付け替える
-                wchar_t nl = dlg_letter(dlg), td[MAX_PATH];
-                GetDlgItemTextW(dlg, IDC_TEMP_DIR, td, ARRAYSIZE(td));
-                if (towupper(td[0]) == g_dlgPrevLetter && td[1] == L':') {
-                    td[0] = nl;
-                    SetDlgItemTextW(dlg, IDC_TEMP_DIR, td);
-                }
-                g_dlgPrevLetter = nl;
-            }
+            if (HIWORD(wp) == CBN_SELCHANGE) dlg_sync_tempdir(dlg);
             return TRUE;
-        case IDOK: {
-            Settings s = g_cfg;
-            BOOL ok;
-            s.letter = dlg_letter(dlg);
-            s.sizeNum = GetDlgItemInt(dlg, IDC_SIZE_EDIT, &ok, FALSE);
-            s.unitGB = SendDlgItemMessageW(dlg, IDC_UNIT, CB_GETCURSEL, 0, 0) == 1;
-            s.fs = (int)SendDlgItemMessageW(dlg, IDC_FS, CB_GETCURSEL, 0, 0);
-            s.temp = IsDlgButtonChecked(dlg, IDC_TEMP_ON) == BST_CHECKED;
-            s.tempUser = IsDlgButtonChecked(dlg, IDC_TEMP_USER) == BST_CHECKED;
-            s.tempSys = IsDlgButtonChecked(dlg, IDC_TEMP_SYS) == BST_CHECKED;
-            GetDlgItemTextW(dlg, IDC_TEMP_DIR, s.tempDir, ARRAYSIZE(s.tempDir));
-            ULONGLONG bytes = cfg_bytes(&s);
-            const wchar_t *bad = NULL;
-            wchar_t m[200];
-            if (!s.letter) bad = L"ドライブ文字を選んでください。";
-            else if (!ok || bytes < MIN_SIZE) bad = L"最大容量は 16 MB 以上にしてください。";
-            else if (bytes > g_physTotal) {
-                format_bytes(g_physTotal, m + 100, 100);
-                swprintf(m, 100, L"最大容量は実メモリ（%ls）以下にしてください。", m + 100);
-                bad = m;
-            } else if (s.fs == FS_FAT32 && bytes > FAT32_MAX)
-                bad = L"FAT32 は 32 GB までです。exFAT か NTFS を選んでください。";
-            else if (s.temp && (s.tempUser || s.tempSys) &&
-                     (towupper(s.tempDir[0]) != s.letter || s.tempDir[1] != L':' || s.tempDir[2] != L'\\'))
-                bad = L"TEMP の切り替え先は、作る RAM ディスク上のフォルダー（例: R:\\Temp）にしてください。";
-            if (bad) {
-                MessageBoxW(dlg, bad, APP_TITLE, MB_ICONWARNING);
-                return TRUE;
-            }
-            s.tempDir[0] = s.letter;
-            g_cfg = s;
-            settings_save(&g_cfg);
-            EndDialog(dlg, IDOK);
+        case IDC_START:
+            if (IsWindowEnabled(GetDlgItem(dlg, IDC_START))) ui_start(dlg);
             return TRUE;
-        }
+        case IDC_STOP:
+            ui_stop(dlg);
+            return TRUE;
         case IDCANCEL:
+            KillTimer(dlg, TIMER_UI);
             EndDialog(dlg, IDCANCEL);
             return TRUE;
         }
@@ -1348,7 +1623,39 @@ static INT_PTR CALLBACK setup_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
     return FALSE;
 }
 
-// ---- タスクトレイ ----
+// 設定画面を開く（すでに開いていれば前に出す）
+static int ui_main(void) {
+    HANDLE mutex = CreateMutexW(NULL, TRUE, L"Local\\RamDay_UI");
+    DWORD e = GetLastError();
+    if (e == ERROR_ALREADY_EXISTS || e == ERROR_ACCESS_DENIED) {
+        HWND d = FindWindowW(L"#32770", DLG_TITLE);
+        if (d) {
+            ShowWindow(d, SW_RESTORE);
+            SetForegroundWindow(d);
+        }
+        if (mutex) CloseHandle(mutex);
+        return 0;
+    }
+    // ワーカーが動いていないのに TEMP の控えが残っている = 前回が正しく終わらなかった
+    SharedStatus st;
+    if (!status_read(&st) && ini_get_int(L"Backup", L"Active", 0) &&
+        MessageBoxW(NULL, L"前回 RamDay が正しく終了しなかったため、TEMP 環境変数が RAM ディスクを指したままの"
+                          L"可能性があります。\n\n元に戻しますか？（管理者権限の確認が出ます）",
+                    APP_TITLE, MB_ICONWARNING | MB_YESNO) == IDYES) {
+        HANDLE p = run_self(L"-restore -quiet", TRUE);
+        if (p) {
+            WaitForSingleObject(p, 60000);
+            CloseHandle(p);
+        }
+    }
+    DialogBoxW(g_inst, MAKEINTRESOURCEW(IDD_SETUP), NULL, setup_proc);
+    if (g_uiWorker) CloseHandle(g_uiWorker);
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    return 0;
+}
+
+// ---- タスクトレイ（ワーカー） ----
 
 static ULONGLONG used_bytes(void) {
     return (ULONGLONG)g_usedBlk << BLK_SHIFT;
@@ -1393,6 +1700,11 @@ static void open_drive(void) {
     ShellExecuteW(NULL, L"open", root, NULL, NULL, SW_SHOWNORMAL);
 }
 
+static void open_settings(void) {
+    HANDLE p = run_self(L"", FALSE);
+    if (p) CloseHandle(p);
+}
+
 static void show_status(void) {
     wchar_t u[32], mx[32], fu[32] = L"?", text[1200], du[600], ds[600];
     format_bytes(used_bytes(), u, ARRAYSIZE(u));
@@ -1418,11 +1730,12 @@ static void show_menu(void) {
     format_bytes(g_diskSize, mx, ARRAYSIZE(mx));
     swprintf(st, ARRAYSIZE(st), L"%lc: メモリ使用 %ls / 最大 %ls ...", g_cfg.letter, u, mx);
     swprintf(op, ARRAYSIZE(op), L"%lc: を開く", g_cfg.letter);
+    AppendMenuW(m, MF_STRING, IDM_SETTINGS, L"設定画面を開く");
     AppendMenuW(m, MF_STRING, IDM_STATUS, st);
     AppendMenuW(m, MF_STRING, IDM_OPEN, op);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_RELEASE, L"解放して終了");
-    SetMenuDefaultItem(m, IDM_OPEN, FALSE);
+    SetMenuDefaultItem(m, IDM_SETTINGS, FALSE);
     POINT pt;
     GetCursorPos(&pt);
     SetForegroundWindow(g_wnd);
@@ -1431,9 +1744,10 @@ static void show_menu(void) {
     DestroyMenu(m);
 }
 
-static BOOL quit_after_release(BOOL force) {
-    if (!release_all(g_wnd, force)) return FALSE;
+static BOOL quit_after_release(BOOL force, BOOL ask) {
+    if (!release_all(g_wnd, force, ask)) return FALSE;
     KillTimer(g_wnd, TIMER_TIP);
+    KillTimer(g_wnd, TIMER_STATUS);
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     DestroyWindow(g_wnd);
     return TRUE;
@@ -1446,6 +1760,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     switch (msg) {
     case WM_TIMER:
+        if (wp == TIMER_STATUS && g_running) status_set(ST_RUNNING);
         if (wp == TIMER_TIP) {
             update_tip();
             static LONG64 lastUsed = -1, lastTrim = -1;
@@ -1458,22 +1773,23 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_TRAY:
         switch (LOWORD(lp)) {
-        case WM_LBUTTONDBLCLK: open_drive(); break;
+        case WM_LBUTTONDBLCLK: open_settings(); break;
         case WM_RBUTTONUP:
         case WM_CONTEXTMENU: show_menu(); break;
         }
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
+        case IDM_SETTINGS: open_settings(); break;
         case IDM_STATUS: show_status(); break;
         case IDM_OPEN: open_drive(); break;
-        case IDM_RELEASE: quit_after_release(FALSE); break;
+        case IDM_RELEASE: quit_after_release(FALSE, TRUE); break;
         }
         return 0;
-    case WM_RELEASE_REQ:
-        return quit_after_release(wp != 0);   // 1 = 解放した、0 = 取りやめた
+    case WM_RELEASE_REQ:                   // 設定画面・-release から。訊くのは依頼した側
+        return quit_after_release(wp != 0, FALSE);   // 1 = 解放した、0 = 使用中で取りやめた
     case WM_CLOSE:
-        quit_after_release(FALSE);
+        quit_after_release(FALSE, TRUE);
         return 0;
     case WM_QUERYENDSESSION:
         return TRUE;
@@ -1482,7 +1798,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp) {
             g_ending = TRUE;
             applog(L"セッション終了のため解放する");
-            release_all(NULL, TRUE);
+            release_all(NULL, TRUE, FALSE);
         }
         return 0;
     case WM_DESTROY:
@@ -1525,6 +1841,86 @@ static int release_running(BOOL force) {
     return r == WAIT_OBJECT_0 ? 0 : 3;
 }
 
+// 管理者が要る作業を、管理者でなければ管理者として起動し直して終わりを待つ
+static int run_elevated_and_wait(const wchar_t *args) {
+    HANDLE p = run_self(args, TRUE);
+    if (!p) return GetLastError() == ERROR_CANCELLED ? 5 : 1;
+    WaitForSingleObject(p, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(p, &code);
+    CloseHandle(p);
+    return (int)code;
+}
+
+// RAM ディスクを作って管理する（管理者）
+static int worker_main(void) {
+    g_worker = TRUE;
+    g_quiet = TRUE;                        // 失敗は ini とログに残し、設定画面が表示する
+    // 終了したばかりの前のワーカーが後始末をしている間は、少し待つ
+    HANDLE mutex = CreateMutexW(NULL, FALSE, L"Global\\RamDay_Instance");
+    DWORD w = mutex ? WaitForSingleObject(mutex, 10000) : WAIT_FAILED;
+    if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) {
+        fail_msg(NULL, L"RamDay はすでに動いています（タスクトレイのアイコンから操作できます）。", 0);
+        return 2;
+    }
+    recover();                             // 前回が正しく終わっていなければ、先に元へ戻す
+    if (g_cfg.letter < L'D' || g_cfg.letter > L'Z' || cfg_bytes(&g_cfg) < MIN_SIZE) {
+        fail_msg(NULL, L"ドライブ文字（D〜Z）か容量（16 MB 以上）の指定が正しくありません。", 0);
+        ReleaseMutex(mutex);
+        return 1;
+    }
+
+    WNDCLASSEXW wc = { .cbSize = sizeof wc };
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = g_inst;
+    wc.hIcon = g_iconLarge;
+    wc.hIconSm = g_iconSmall;
+    wc.lpszClassName = WND_CLASS;
+    RegisterClassExW(&wc);
+    g_wnd = CreateWindowExW(0, WND_CLASS, APP_TITLE, WS_OVERLAPPED, 0, 0, 0, 0, NULL, NULL, g_inst, NULL);
+    g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    ChangeWindowMessageFilterEx(g_wnd, g_msgTaskbarCreated, MSGFLT_ALLOW, NULL);
+    // 一般権限の設定画面・-release からの解放依頼を受け付ける
+    ChangeWindowMessageFilterEx(g_wnd, WM_RELEASE_REQ, MSGFLT_ALLOW, NULL);
+    status_open();
+    status_set(ST_STARTING);
+
+    BOOL ok = start_all(&g_cfg);
+    if (!ok) {
+        DestroyWindow(g_wnd);
+        status_close();
+        ReleaseMutex(mutex);
+        broadcast_wait(5000);
+        return 1;
+    }
+    status_set(ST_RUNNING);
+    tray_add();
+    SetTimer(g_wnd, TIMER_TIP, TIP_MS, NULL);
+    SetTimer(g_wnd, TIMER_STATUS, STATUS_MS, NULL);
+    wchar_t mx[32], text[256];
+    format_bytes(g_diskSize, mx, ARRAYSIZE(mx));
+    if (g_envChanged)
+        swprintf(text, ARRAYSIZE(text), L"%lc: を作りました（最大 %ls・%ls）。\nTEMP と TMP を %ls に切り替えました。",
+                 g_cfg.letter, mx, FS_NAMES[g_cfg.fs], g_cfg.tempDir);
+    else
+        swprintf(text, ARRAYSIZE(text), L"%lc: を作りました（最大 %ls・%ls）。", g_cfg.letter, mx, FS_NAMES[g_cfg.fs]);
+    tray_balloon(text);
+
+    MSG m;
+    while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    release_all(NULL, TRUE, FALSE);        // 念のため（通常はここに来る前に済んでいる）
+    // 解放が済んだら、すぐ次のワーカーを起動できるようにする（通知を待つのはその後）
+    status_close();
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    broadcast_wait(5000);                  // ドライブ削除・環境変数の通知を届けきる
+    applog(L"終了");
+    return 0;
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
     (void)prev; (void)cmdLine; (void)show;
     g_inst = inst;
@@ -1548,14 +1944,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
                                     GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
 
     settings_load(&g_cfg);
-    BOOL cli = FALSE, doRelease = FALSE, force = FALSE, doRestore = FALSE, tempGiven = FALSE;
+    BOOL cli = FALSE, worker = FALSE, doRelease = FALSE, force = FALSE, doRestore = FALSE, tempGiven = FALSE;
     int argc;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; argv && i < argc; i++) {
         const wchar_t *a = argv[i];
         if (a[0] == L'-' || a[0] == L'/') a++;
         BOOL has = i + 1 < argc;
-        if (!_wcsicmp(a, L"release")) doRelease = TRUE;
+        if (!_wcsicmp(a, L"worker")) worker = TRUE;
+        else if (!_wcsicmp(a, L"release")) doRelease = TRUE;
         else if (!_wcsicmp(a, L"force")) force = TRUE;
         else if (!_wcsicmp(a, L"restore")) doRestore = TRUE;
         else if (!_wcsicmp(a, L"quiet")) g_quiet = TRUE;
@@ -1583,73 +1980,35 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
     if (argv) LocalFree(argv);
     if (cli && !tempGiven) swprintf(g_cfg.tempDir, MAX_PATH, L"%lc:\\Temp", g_cfg.letter);
 
-    if (doRelease) return release_running(force);
+    if (doRelease) return release_running(force);   // ワーカーが受け付けるので管理者は要らない
 
-    HANDLE mutex = CreateMutexW(NULL, TRUE, L"Global\\RamDay_Instance");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (!g_quiet)
-            MessageBoxW(NULL, L"RamDay はすでに動いています（タスクトレイのアイコンから操作できます）。",
-                        APP_TITLE, MB_ICONINFORMATION);
-        return 2;
-    }
-
-    if (recover() && !g_quiet && !doRestore)
-        MessageBoxW(NULL, L"前回 RamDay が正しく終了しなかったため、TEMP 環境変数などを元に戻しました。",
-                    APP_TITLE, MB_ICONINFORMATION);
     if (doRestore) {
+        if (!is_elevated()) {
+            wchar_t args[64];
+            swprintf(args, ARRAYSIZE(args), L"-restore%ls", g_quiet ? L" -quiet" : L"");
+            return run_elevated_and_wait(args);
+        }
+        HANDLE mutex = CreateMutexW(NULL, TRUE, L"Global\\RamDay_Instance");
+        if (GetLastError() == ERROR_ALREADY_EXISTS) return 2;   // 動いている間は後始末しない
+        BOOL did = recover();
         driver_release_if_idle();          // 読み込んだままのドライバが空いていれば止める
         broadcast_wait(5000);
         ReleaseMutex(mutex);
+        if (did && !g_quiet)
+            MessageBoxW(NULL, L"TEMP 環境変数などを元に戻しました。", APP_TITLE, MB_ICONINFORMATION);
         return 0;
     }
 
-    if (!cli) {
-        if (DialogBoxW(inst, MAKEINTRESOURCEW(IDD_SETUP), NULL, setup_proc) != IDOK) return 0;
-    } else if (g_cfg.letter < L'D' || g_cfg.letter > L'Z' || cfg_bytes(&g_cfg) < MIN_SIZE) {
-        fail_msg(NULL, L"ドライブ文字（D〜Z）か容量（16 MB 以上）の指定が正しくありません。", 0);
-        return 1;
+    if (worker || cli) {                   // ワーカー（コマンドラインからの開始もここ）
+        if (!is_elevated()) {
+            wchar_t args[2048];
+            swprintf(args, ARRAYSIZE(args), L"%ls%ls", worker ? L"" : L"-worker ", cmdline_args());
+            HANDLE p = run_self(args, TRUE);
+            if (!p) return GetLastError() == ERROR_CANCELLED ? 5 : 1;
+            CloseHandle(p);
+            return 0;
+        }
+        return worker_main();
     }
-
-    WNDCLASSEXW wc = { .cbSize = sizeof wc };
-    wc.lpfnWndProc = wnd_proc;
-    wc.hInstance = inst;
-    wc.hIcon = g_iconLarge;
-    wc.hIconSm = g_iconSmall;
-    wc.lpszClassName = WND_CLASS;
-    RegisterClassExW(&wc);
-    g_wnd = CreateWindowExW(0, WND_CLASS, APP_TITLE, WS_OVERLAPPED, 0, 0, 0, 0, NULL, NULL, inst, NULL);
-    g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
-    ChangeWindowMessageFilterEx(g_wnd, g_msgTaskbarCreated, MSGFLT_ALLOW, NULL);
-
-    HCURSOR old = SetCursor(LoadCursor(NULL, IDC_WAIT));
-    BOOL ok = start_all(&g_cfg);
-    SetCursor(old);
-    if (!ok) {
-        DestroyWindow(g_wnd);
-        broadcast_wait(5000);
-        ReleaseMutex(mutex);
-        return 1;
-    }
-
-    tray_add();
-    SetTimer(g_wnd, TIMER_TIP, TIP_MS, NULL);
-    wchar_t mx[32], text[256];
-    format_bytes(g_diskSize, mx, ARRAYSIZE(mx));
-    if (g_envChanged)
-        swprintf(text, ARRAYSIZE(text), L"%lc: を作りました（最大 %ls・%ls）。\nTEMP と TMP を %ls に切り替えました。",
-                 g_cfg.letter, mx, FS_NAMES[g_cfg.fs], g_cfg.tempDir);
-    else
-        swprintf(text, ARRAYSIZE(text), L"%lc: を作りました（最大 %ls・%ls）。", g_cfg.letter, mx, FS_NAMES[g_cfg.fs]);
-    tray_balloon(text);
-
-    MSG m;
-    while (GetMessageW(&m, NULL, 0, 0) > 0) {
-        TranslateMessage(&m);
-        DispatchMessageW(&m);
-    }
-    release_all(NULL, TRUE);               // 念のため（通常はここに来る前に済んでいる）
-    broadcast_wait(5000);                  // ドライブ削除・環境変数の通知を届けきる
-    ReleaseMutex(mutex);
-    applog(L"終了");
-    return 0;
+    return ui_main();
 }

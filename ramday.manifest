@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="nekoryu.RamDay" version="1.0.0.0"/>
+  <assemblyIdentity type="win32" name="nekoryu.RamDay" version="1.1.0.0"/>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0"
@@ -16,8 +16,8 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <!-- ドライバの読み込みとシステム側 TEMP の書き換えに管理者権限が要る -->
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+        <!-- 設定画面は一般権限で開く。管理者が要るワーカーは「開始」のときに昇格して起動する -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>
