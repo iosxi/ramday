@@ -1,0 +1,34 @@
+#pragma code_page(65001)
+#include <windows.h>
+
+LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
+// ツールチェーン既定の manifest と同じ言語にして置き換えさせる
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "ramdaylaunch.manifest"
+
+LANGUAGE LANG_JAPANESE, SUBLANG_DEFAULT
+1 ICON "ramday.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,2,0,0
+ PRODUCTVERSION 1,2,0,0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041104b0"
+        BEGIN
+            VALUE "CompanyName", "nekoryu"
+            VALUE "FileDescription", "RamDay を前回の設定で開始する"
+            VALUE "FileVersion", "1.2.0"
+            VALUE "ProductName", "RamDay"
+            VALUE "ProductVersion", "1.2.0"
+            VALUE "Comments", "スタートアップに登録して使う。同じフォルダーの RamDay.exe を起動してすぐ終わる"
+            VALUE "OriginalFilename", "RamDayLaunch.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0411, 1200
+    END
+END

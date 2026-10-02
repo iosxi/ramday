@@ -3,7 +3,8 @@
 使った分だけメモリを確保し、ファイルを消せば自動でメモリを返す RAM ディスク。
 起動中は Windows の TEMP / TMP 環境変数を RAM ディスクに切り替え、解放するときに元へ戻す。
 
-- **インストール不要**。`RamDay.exe` 1 個で動く（ドライバも exe に埋め込んである）
+- **インストール不要**。`RamDay.exe` 1 個で動く（ドライバも exe に埋め込んである）。
+  Windows の起動時に自動で始めたいときは `RamDayLaunch.exe` も置く
 - **レジストリに残さない**。ドライバの登録は起動中だけで、TEMP の元の値は exe の隣の
   `RamDay.ini` に控える（詳しくは「レジストリについて」）
 - 最小容量は 0 バイト。書き込んだ分だけメモリを使い、上限は起動時に指定した最大容量
@@ -13,6 +14,8 @@
 | ファイル | 役割 |
 | --- | --- |
 | `RamDay.exe` | **これ 1 個で動く**。依存は Windows 標準の DLL だけ |
+| `RamDayLaunch.exe` | 前回「開始」した設定で RamDay を開始して、すぐ終わる（スタートアップ登録用） |
+| `ramdaylaunch.c` / `.rc` / `.manifest` | `RamDayLaunch.exe` のソース・リソース・マニフェスト |
 | `ramday.c` | 本体のソース |
 | `ramday.rc` / `resource.h` | ダイアログ・アイコン・バージョン情報・埋め込みドライバのリソース |
 | `ramday.manifest` | 見た目（コモンコントロール v6）と高 DPI 対応の宣言。権限は一般（`asInvoker`） |
@@ -55,6 +58,24 @@
 RAM ディスク上のファイルを開いたままのプログラムがあると、終了のときに
 「強制的に終了しますか？」と訊く。強制すると、そのファイルの保存していない内容は失われる。
 
+## Windows の起動時に自動で開始する（RamDayLaunch.exe）
+
+`RamDayLaunch.exe` を `RamDay.exe` と**同じフォルダー**に置き、スタートアップに登録する。
+
+1. `Win + R` で `shell:startup` を開く（スタートアップフォルダーが開く）
+2. そこに `RamDayLaunch.exe` のショートカットを作る
+
+ログオンすると、`RamDayLaunch.exe` が `RamDay.exe -start` を起動してすぐ終わり、
+`RamDay.exe` が**前回「開始」した設定**（`RamDay.ini`）でワーカーを起動する。
+
+- すでに RamDay が動いていれば何もしない。
+- まだ一度も「開始」していなければ、設定画面を開く。
+- 開始できなかったとき（ドライブ文字が使われていた、など）は理由をメッセージで出す。
+- ドライバの読み込みに管理者権限が要るので、UAC の確認が出る設定の PC では、ログオンのたびに
+  確認が 1 回出る（「確認せずに昇格する」設定なら出ない）。タスクスケジューラに
+  「最上位の特権で実行」で登録すれば確認なしにできるが、Windows 側に登録が残るので RamDay は使わない。
+- `RamDayLaunch.exe` 自身は管理者を求めない（管理者を求める exe はスタートアップから起動されないため）。
+
 ## コマンドライン
 
 引数を付けると設定画面を出さずにすぐ開始する（ワーカーを起動する。管理者でなければ
@@ -64,6 +85,7 @@ RAM ディスク上のファイルを開いたままのプログラムがある�
 RamDay.exe -d R -s 4G -fs NTFS                 R: に最大 4 GB の NTFS。TEMP は R:\Temp へ
 RamDay.exe -d R -s 512M -fs exFAT -notemp      TEMP は切り替えない
 RamDay.exe -d T -s 8G -temp T:\tmp -scope user ユーザー側の TEMP / TMP だけ T:\tmp へ
+RamDay.exe -start                              前回「開始」した設定で開始する（RamDayLaunch.exe と同じ）
 RamDay.exe -release                            動いている RamDay を解放して終了させる（管理者不要）
 RamDay.exe -release -force                     使用中のファイルがあっても強制的に解放
 RamDay.exe -restore                            前回の異常終了の後始末だけ行う（管理者の確認が出る）

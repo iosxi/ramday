@@ -18,6 +18,7 @@
 //
 // コマンドライン（指定すると設定画面を出さずにワーカーを起動する。自動化・検証用）:
 //   RamDay.exe -d R -s 4G -fs NTFS [-temp R:\Temp | -notemp] [-scope both|user|system] [-quiet]
+//   RamDay.exe -start              前回「開始」した設定（RamDay.ini）で開始する（RamDayLaunch.exe が使う）
 //   RamDay.exe -release [-force]   動作中の RamDay を解放して終了させる
 //   RamDay.exe -restore            前回の異常終了の後始末（TEMP の復元など）だけ行う
 #include <windows.h>
@@ -219,6 +220,9 @@ static void settings_load(Settings *s) {
     wchar_t def[16];
     swprintf(def, ARRAYSIZE(def), L"%lc:\\Temp", s->letter);
     ini_get(L"Settings", L"TempDir", def, s->tempDir, ARRAYSIZE(s->tempDir));
+    // 切り替え先は RAM ディスク上に置くものなので、ドライブ文字を揃えておく
+    // （ini を手で書き換えて食い違っても、別のドライブの TEMP を書き換えないため）
+    if (s->tempDir[0] && s->tempDir[1] == L':') s->tempDir[0] = s->letter;
 }
 
 static void settings_save(const Settings *s) {
@@ -1852,6 +1856,48 @@ static int run_elevated_and_wait(const wchar_t *args) {
     return (int)code;
 }
 
+static int worker_main(void);
+
+// 前回「開始」した設定（RamDay.ini）で開始する。スタートアップ用の RamDayLaunch.exe から呼ばれる。
+// ワーカーが動き出すか失敗するまで見届け、失敗したら理由を出す（-quiet ならログだけ）
+static int start_saved(void) {
+    SharedStatus st;
+    if (status_read(&st)) return 0;        // もう動いている
+    wchar_t probe[8];
+    ini_get(L"Settings", L"Drive", L"", probe, ARRAYSIZE(probe));
+    if (!probe[0]) {                       // まだ一度も開始していない → 設定画面で選んでもらう
+        applog(L"-start: 前回の設定がないので設定画面を開く");
+        return ui_main();
+    }
+    if (is_elevated()) return worker_main();
+    wchar_t args[MAX_PATH + 128];
+    worker_args(&g_cfg, args, ARRAYSIZE(args));
+    ini_put(L"Status", L"LastError", NULL);
+    ini_flush();
+    applog(L"-start: 前回の設定で開始する（%ls）", args);
+    HANDLE p = run_self(args, TRUE);
+    if (!p) {
+        DWORD e = GetLastError();
+        applog(L"-start: ワーカーを起動できなかった（エラー %lu）", e);
+        return e == ERROR_CANCELLED ? 5 : 1;
+    }
+    DWORD code = STILL_ACTIVE;
+    for (int i = 0; i < 1200; i++) {       // 最長 2 分
+        if (status_read(&st) && st.state == ST_RUNNING) break;
+        if (WaitForSingleObject(p, 100) == WAIT_OBJECT_0) {
+            GetExitCodeProcess(p, &code);
+            break;
+        }
+    }
+    CloseHandle(p);
+    if (code == STILL_ACTIVE || code == 0) return 0;
+    wchar_t err[1024];
+    ini_get(L"Status", L"LastError", L"", err, ARRAYSIZE(err));
+    if (!err[0]) swprintf(err, ARRAYSIZE(err), L"RAM ディスクを開始できませんでした（終了コード %lu）。", code);
+    if (!g_quiet) MessageBoxW(NULL, err, APP_TITLE, MB_ICONERROR);
+    return (int)code;
+}
+
 // RAM ディスクを作って管理する（管理者）
 static int worker_main(void) {
     g_worker = TRUE;
@@ -1866,6 +1912,13 @@ static int worker_main(void) {
     recover();                             // 前回が正しく終わっていなければ、先に元へ戻す
     if (g_cfg.letter < L'D' || g_cfg.letter > L'Z' || cfg_bytes(&g_cfg) < MIN_SIZE) {
         fail_msg(NULL, L"ドライブ文字（D〜Z）か容量（16 MB 以上）の指定が正しくありません。", 0);
+        ReleaseMutex(mutex);
+        return 1;
+    }
+    // 設定画面と同じ検査を、コマンドライン・-start から来たときにも必ず通す
+    if (g_cfg.temp && (g_cfg.tempUser || g_cfg.tempSys) &&
+        (towupper(g_cfg.tempDir[0]) != g_cfg.letter || g_cfg.tempDir[1] != L':' || g_cfg.tempDir[2] != L'\\')) {
+        fail_msg(NULL, L"TEMP の切り替え先は、作る RAM ディスク上のフォルダー（例: R:\\Temp）にしてください。", 0);
         ReleaseMutex(mutex);
         return 1;
     }
@@ -1945,6 +1998,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
 
     settings_load(&g_cfg);
     BOOL cli = FALSE, worker = FALSE, doRelease = FALSE, force = FALSE, doRestore = FALSE, tempGiven = FALSE;
+    BOOL doStart = FALSE;
     int argc;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; argv && i < argc; i++) {
@@ -1957,6 +2011,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
         else if (!_wcsicmp(a, L"restore")) doRestore = TRUE;
         else if (!_wcsicmp(a, L"quiet")) g_quiet = TRUE;
         else if (!_wcsicmp(a, L"verbose")) g_verbose = TRUE;
+        else if (!_wcsicmp(a, L"start")) doStart = TRUE;
         else if (!_wcsicmp(a, L"notemp")) { g_cfg.temp = FALSE; cli = TRUE; }
         else if (!_wcsicmp(a, L"d") && has) { g_cfg.letter = towupper(argv[++i][0]); cli = TRUE; }
         else if (!_wcsicmp(a, L"s") && has) {
@@ -1998,6 +2053,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
             MessageBoxW(NULL, L"TEMP 環境変数などを元に戻しました。", APP_TITLE, MB_ICONINFORMATION);
         return 0;
     }
+
+    if (doStart) return start_saved();
 
     if (worker || cli) {                   // ワーカー（コマンドラインからの開始もここ）
         if (!is_elevated()) {

@@ -49,8 +49,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,1,0,0
- PRODUCTVERSION 1,1,0,0
+ FILEVERSION 1,2,0,0
+ PRODUCTVERSION 1,2,0,0
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_APP
 BEGIN
@@ -60,9 +60,9 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "nekoryu"
             VALUE "FileDescription", "RamDay（伸び縮みする RAM ディスク）"
-            VALUE "FileVersion", "1.1.0"
+            VALUE "FileVersion", "1.2.0"
             VALUE "ProductName", "RamDay"
-            VALUE "ProductVersion", "1.1.0"
+            VALUE "ProductVersion", "1.2.0"
             VALUE "Comments", "使った分だけメモリを確保し、不要になれば解放する RAM ディスク"
             VALUE "OriginalFilename", "RamDay.exe"
         END
