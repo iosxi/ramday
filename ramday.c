@@ -1689,15 +1689,6 @@ static void tray_add(void) {
     update_tip();
 }
 
-static void tray_balloon(const wchar_t *text) {
-    g_nid.uFlags = NIF_INFO;
-    wcsncpy(g_nid.szInfo, text, ARRAYSIZE(g_nid.szInfo) - 1);
-    wcscpy(g_nid.szInfoTitle, APP_TITLE);
-    g_nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
-    g_nid.hBalloonIcon = g_iconLarge;
-    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-}
-
 static void open_drive(void) {
     wchar_t root[] = L" :\\";
     root[0] = g_cfg.letter;
@@ -1950,14 +1941,6 @@ static int worker_main(void) {
     tray_add();
     SetTimer(g_wnd, TIMER_TIP, TIP_MS, NULL);
     SetTimer(g_wnd, TIMER_STATUS, STATUS_MS, NULL);
-    wchar_t mx[32], text[256];
-    format_bytes(g_diskSize, mx, ARRAYSIZE(mx));
-    if (g_envChanged)
-        swprintf(text, ARRAYSIZE(text), L"%lc: を作りました（最大 %ls・%ls）。\nTEMP と TMP を %ls に切り替えました。",
-                 g_cfg.letter, mx, FS_NAMES[g_cfg.fs], g_cfg.tempDir);
-    else
-        swprintf(text, ARRAYSIZE(text), L"%lc: を作りました（最大 %ls・%ls）。", g_cfg.letter, mx, FS_NAMES[g_cfg.fs]);
-    tray_balloon(text);
 
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {
