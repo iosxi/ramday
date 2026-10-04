@@ -209,8 +209,12 @@ MinGW-w64（gcc と windres）が PATH にある状態で `build.cmd` を実行�
 
 ## ライセンス
 
-- `imdisk/imdisk.sys` は [ImDisk Virtual Disk Driver](https://github.com/LTRData/ImDisk)
-  （Copyright Olof Lagerkvist）の配布物を改変せずに同梱している。ライセンスは GPL v2
-  （`imdisk/LICENSE-ImDisk.txt`）。ソースは上記リポジトリにある。
+- `RamDay.exe` には [ImDisk Virtual Disk Driver](https://github.com/LTRData/ImDisk)
+  （Copyright Olof Lagerkvist）のドライバ `imdisk.sys`（2.1.2.66）を、改変せずに
+  リソースとして**埋め込んでいる**。別ファイルとしては配っていない。実行時に exe の隣
+  （書けなければ `C:\Windows\Temp`）へ書き出して読み込む。
+  リポジトリでは `imdisk/imdisk.sys` に元のファイルを置いている。
+- ImDisk のライセンスは GPL v2（`imdisk/LICENSE-ImDisk.txt`）。GitHub Release にも
+  `LICENSE-ImDisk.txt` を exe と一緒に添付している。ソースは上記リポジトリにある。
 - RamDay は ImDisk のプロキシ通信の仕様（`inc/imdproxy.h`、MIT 系ライセンス）に従って
   ドライバと通信する。

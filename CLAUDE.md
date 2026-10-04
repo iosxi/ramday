@@ -12,6 +12,9 @@
 - リリースの添付物: **`RamDay.exe` と `RamDayLaunch.exe`**（v3 から）。改名せず、そのまま `gh release create` に渡す
   （単体で置いて使うものなので、版ごとに名前が変わると更新のたびに旧版が残る。
   sleep-guard と同じ方針）。ドライバは exe に埋め込んであるので、exe 1 個で足りる。
+- **`imdisk/LICENSE-ImDisk.txt` も毎回添付する**（埋め込んだ imdisk.sys が GPL v2 なので、
+  バイナリと一緒にライセンス文を届ける）。`gh release create vN RamDay.exe RamDayLaunch.exe imdisk/LICENSE-ImDisk.txt`。
+  v1〜v3 には後から `gh release upload` で足した（2026-10-04）。
 - バージョン: タグの `vN` とは別に、`ramday.rc` の VERSIONINFO と
   `ramday.manifest` の `assemblyIdentity` がある。機能が変わったら両方上げる。
 
