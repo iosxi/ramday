@@ -18,6 +18,7 @@
 #define IDC_START        219
 #define IDC_STOP         220
 #define IDC_CUR_LABEL    221
+#define IDC_COMPRESS     222
 
 #define IDM_STATUS       300
 #define IDM_OPEN         301

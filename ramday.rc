@@ -12,7 +12,7 @@ IDI_APP ICON "ramday.ico"
 // ImDisk の署名済みドライバ（無改変）。imdisk.sys が exe の隣に無ければここから書き出す
 IDR_IMDISK_SYS RCDATA "imdisk\\imdisk.sys"
 
-IDD_SETUP DIALOGEX 0, 0, 284, 296
+IDD_SETUP DIALOGEX 0, 0, 284, 324
 STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "RamDay — RAM ディスクの作成"
@@ -21,7 +21,7 @@ BEGIN
     GROUPBOX        "状態", -1, 7, 6, 270, 30
     LTEXT           "", IDC_STATUS, 16, 19, 256, 10, SS_ENDELLIPSIS
 
-    GROUPBOX        "RAM ディスク", -1, 7, 40, 270, 100
+    GROUPBOX        "RAM ディスク", -1, 7, 40, 270, 128
     LTEXT           "ドライブ文字:", -1, 16, 56, 62, 10
     COMBOBOX        IDC_DRIVE, 80, 54, 44, 200, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     LTEXT           "最大容量:", -1, 16, 74, 62, 10
@@ -31,26 +31,28 @@ BEGIN
     LTEXT           "最小容量は 0 バイト。書き込んだ分だけメモリを確保し、ファイルを消すと解放します。", -1, 16, 90, 256, 18
     LTEXT           "ファイルシステム:", -1, 16, 118, 62, 10
     COMBOBOX        IDC_FS, 80, 116, 56, 100, CBS_DROPDOWNLIST | WS_TABSTOP
+    AUTOCHECKBOX    "メモリ上で圧縮する", IDC_COMPRESS, 16, 136, 252, 11, WS_TABSTOP
+    LTEXT           "数秒書き込みのない部分を裏で圧縮し、メモリを節約します。読み書きは少し遅くなります。", -1, 26, 149, 246, 18
 
-    GROUPBOX        "TEMP 環境変数", -1, 7, 146, 270, 124
-    AUTOCHECKBOX    "TEMP と TMP を RAM ディスクへ一時的に切り替える", IDC_TEMP_ON, 16, 160, 252, 11, WS_TABSTOP
-    LTEXT           "切り替え先:", IDC_TEMP_LABEL, 26, 178, 50, 10
-    EDITTEXT        IDC_TEMP_DIR, 80, 176, 188, 13, ES_AUTOHSCROLL | WS_TABSTOP
-    AUTOCHECKBOX    "ユーザー", IDC_TEMP_USER, 80, 194, 60, 11, WS_TABSTOP
-    AUTOCHECKBOX    "システム", IDC_TEMP_SYS, 144, 194, 60, 11, WS_TABSTOP
-    LTEXT           "", IDC_CUR_LABEL, 16, 212, 252, 10
-    LTEXT           "", IDC_CUR_USER, 24, 225, 246, 10, SS_PATHELLIPSIS
-    LTEXT           "", IDC_CUR_SYS, 24, 237, 246, 10, SS_PATHELLIPSIS
-    LTEXT           "（ユーザーとシステムの TEMP・TMP を、それぞれ元の値で控えます）", -1, 24, 251, 246, 10
+    GROUPBOX        "TEMP 環境変数", -1, 7, 174, 270, 124
+    AUTOCHECKBOX    "TEMP と TMP を RAM ディスクへ一時的に切り替える", IDC_TEMP_ON, 16, 188, 252, 11, WS_TABSTOP
+    LTEXT           "切り替え先:", IDC_TEMP_LABEL, 26, 206, 50, 10
+    EDITTEXT        IDC_TEMP_DIR, 80, 204, 188, 13, ES_AUTOHSCROLL | WS_TABSTOP
+    AUTOCHECKBOX    "ユーザー", IDC_TEMP_USER, 80, 222, 60, 11, WS_TABSTOP
+    AUTOCHECKBOX    "システム", IDC_TEMP_SYS, 144, 222, 60, 11, WS_TABSTOP
+    LTEXT           "", IDC_CUR_LABEL, 16, 240, 252, 10
+    LTEXT           "", IDC_CUR_USER, 24, 253, 246, 10, SS_PATHELLIPSIS
+    LTEXT           "", IDC_CUR_SYS, 24, 265, 246, 10, SS_PATHELLIPSIS
+    LTEXT           "（ユーザーとシステムの TEMP・TMP を、それぞれ元の値で控えます）", -1, 24, 279, 246, 10
 
-    DEFPUSHBUTTON   "開始", IDC_START, 108, 276, 52, 15, WS_TABSTOP
-    PUSHBUTTON      "終了", IDC_STOP, 166, 276, 52, 15, WS_TABSTOP
-    PUSHBUTTON      "閉じる", IDCANCEL, 224, 276, 52, 15, WS_TABSTOP
+    DEFPUSHBUTTON   "開始", IDC_START, 108, 304, 52, 15, WS_TABSTOP
+    PUSHBUTTON      "終了", IDC_STOP, 166, 304, 52, 15, WS_TABSTOP
+    PUSHBUTTON      "閉じる", IDCANCEL, 224, 304, 52, 15, WS_TABSTOP
 END
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,3,0,0
- PRODUCTVERSION 1,3,0,0
+ FILEVERSION 1,4,0,0
+ PRODUCTVERSION 1,4,0,0
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_APP
 BEGIN
@@ -60,9 +62,9 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "nekoryu"
             VALUE "FileDescription", "RamDay（伸び縮みする RAM ディスク）"
-            VALUE "FileVersion", "1.3.0"
+            VALUE "FileVersion", "1.4.0"
             VALUE "ProductName", "RamDay"
-            VALUE "ProductVersion", "1.3.0"
+            VALUE "ProductVersion", "1.4.0"
             VALUE "Comments", "使った分だけメモリを確保し、不要になれば解放する RAM ディスク"
             VALUE "OriginalFilename", "RamDay.exe"
         END

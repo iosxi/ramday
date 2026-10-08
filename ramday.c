@@ -5,6 +5,7 @@
 //   その「プロキシ」型デバイスを共有メモリ経由でこのプロセスにつなぎ、読み書きを
 //   ここで受け持つ。中身は 64KB ブロック単位で、書かれたブロックだけメモリを
 //   コミットし、TRIM と空きビットマップの回収で、要らなくなったブロックを返す。
+//   圧縮を選ぶと、しばらく書かれていないブロックを XPRESS で圧縮して置き直す。
 //
 // レジストリに残さないために:
 //   - ImDisk が未インストールなら、起動中だけドライバをサービス登録し、終了時に
@@ -17,7 +18,7 @@
 //   ワーカー（-worker、管理者）     : RAM ディスクを持ち、トレイに常駐する。状態を共有メモリで公開する
 //
 // コマンドライン（指定すると設定画面を出さずにワーカーを起動する。自動化・検証用）:
-//   RamDay.exe -d R -s 4G -fs NTFS [-temp R:\Temp | -notemp] [-scope both|user|system] [-quiet]
+//   RamDay.exe -d R -s 4G -fs NTFS [-compress] [-temp R:\Temp | -notemp] [-scope both|user|system] [-quiet]
 //   RamDay.exe -start              前回「開始」した設定（RamDay.ini）で開始する（RamDayLaunch.exe が使う）
 //   RamDay.exe -release [-force]   動作中の RamDay を解放して終了させる
 //   RamDay.exe -restore            前回の異常終了の後始末（TEMP の復元など）だけ行う
@@ -98,6 +99,7 @@ typedef struct {
     ULONGLONG sizeNum;
     BOOL      unitGB;
     int       fs;
+    BOOL      compress;                    // しばらく書かれていない中身をメモリ上で圧縮する
     BOOL      temp, tempUser, tempSys;
     wchar_t   tempDir[MAX_PATH];
 } Settings;
@@ -163,6 +165,18 @@ static void format_bytes(ULONGLONG b, wchar_t *buf, size_t n) {
     else                        swprintf(buf, n, L"%llu バイト", b);
 }
 
+// メモリの使用量。圧縮しているときは圧縮前の量も添える: 「120 MB（圧縮前 300 MB）」
+static void format_usage(ULONGLONG mem, ULONGLONG data, BOOL comp, wchar_t *buf, size_t n) {
+    wchar_t m[32], d[32];
+    format_bytes(mem, m, ARRAYSIZE(m));
+    if (!comp) {
+        swprintf(buf, n, L"%ls", m);
+        return;
+    }
+    format_bytes(data, d, ARRAYSIZE(d));
+    swprintf(buf, n, L"%ls（圧縮前 %ls）", m, d);
+}
+
 static ULONGLONG cfg_bytes(const Settings *s) {
     return s->sizeNum << (s->unitGB ? 30 : 20);
 }
@@ -214,6 +228,7 @@ static void settings_load(Settings *s) {
     ini_get(L"Settings", L"FileSystem", L"NTFS", b, ARRAYSIZE(b));
     s->fs = FS_NTFS;
     for (int i = 0; i < FS_COUNT; i++) if (!_wcsicmp(b, FS_NAMES[i])) s->fs = i;
+    s->compress = (BOOL)ini_get_int(L"Settings", L"Compress", 0);
     s->temp = (BOOL)ini_get_int(L"Settings", L"Temp", 1);
     s->tempUser = (BOOL)ini_get_int(L"Settings", L"TempUser", 1);
     s->tempSys = (BOOL)ini_get_int(L"Settings", L"TempSystem", 1);
@@ -231,6 +246,7 @@ static void settings_save(const Settings *s) {
     ini_put_int(L"Settings", L"Size", s->sizeNum);
     ini_put(L"Settings", L"Unit", s->unitGB ? L"GB" : L"MB");
     ini_put(L"Settings", L"FileSystem", FS_NAMES[s->fs]);
+    ini_put_int(L"Settings", L"Compress", s->compress);
     ini_put_int(L"Settings", L"Temp", s->temp);
     ini_put_int(L"Settings", L"TempUser", s->tempUser);
     ini_put_int(L"Settings", L"TempSystem", s->tempSys);
@@ -247,14 +263,18 @@ static void settings_save(const Settings *s) {
 //   - TRIM / ZERO 要求（ファイルシステムやドライバが送ってくる）
 //   - 回収スレッドがファイルシステムの空きビットマップを読み、全クラスタが
 //     空きのブロックを返す（TRIM を送らない FAT 系や、TRIM が来ない場合の備え）
+// 圧縮を選んだときは、しばらく書かれていないブロックを圧縮して別の置き場へ移す
+// （「圧縮」の節）。
 // ブロック表は g_storeLock で守る。プロキシは要求 1 件ごとに排他で取る。
 
 #define BLK_SHIFT 16
 #define BLK_SIZE  ((ULONGLONG)1 << BLK_SHIFT)
 #define BLK_MASK  (BLK_SIZE - 1)
+#define BLK_RAW   1                        // g_bmap: アドレス空間にコミットしてそのまま置いている
+#define BLK_COMP  2                        // g_bmap: 圧縮して g_comp に置いている（アドレス空間はデコミット）
 
 static BYTE           *g_base;             // 予約したアドレス空間
-static BYTE           *g_bmap;             // ブロックごとに 1 = コミット済み
+static BYTE           *g_bmap;             // ブロックごとに 0 = 空、BLK_RAW、BLK_COMP
 static LONG           *g_blkGen;           // ブロックに最後に書いたときの世代（回収との競合よけ）
 static volatile LONG   g_gen;              // 回収の走査ごとに 1 進める
 static SRWLOCK         g_storeLock = SRWLOCK_INIT;
@@ -263,6 +283,60 @@ static volatile LONG64 g_usedBlk;
 static ULONGLONG       g_wsMin;            // 今の作業セット下限（ページアウトさせないため）
 static BOOL            g_wsWarned;
 static volatile LONG64 g_stTrimReq, g_stTrimBytes, g_stTrimFreed, g_stReclaimed;
+
+// ---- 圧縮（設定で選んだときだけ） ----
+//
+// 書き込みの経路はそのままにして、しばらく（COLD_SEC 秒）書かれていないブロックを
+// 裏のスレッドが XPRESS（ntdll の RtlCompressBuffer）で圧縮し、専用ヒープへ移して
+// 元のブロックをデコミットする。読むときはその場で伸長し（直前の 1 ブロックは
+// 伸長したまま持っておく）、書くときは伸長してアドレス空間へ戻す。
+// 3/4 より小さくならないブロック（圧縮済みのファイルなど）は、次に書かれるまで試さない。
+//
+// 圧縮スレッドは、ブロックをロックの中で写し、ロックの外で圧縮し、またロックを
+// 取って「写したときから書かれていない」（g_blkTick が同じ）ことを確かめてから置き換える。
+// 書き込みは g_blkTick を今の時刻（秒）にし、写した時点の値より必ず COLD_SEC 以上
+// 新しくなるので、間に書かれたブロックを古い中身で置き換えることはない。
+//
+// XPRESS は 64KB 単位の実測（2026-10-08）で、圧縮 356〜458 MB/s・伸長 1.0〜1.3 GB/s、
+// 実行ファイル類が 50%、テキストが 33% に縮んだ。LZNT1（NTFS 圧縮と同じ）は圧縮が
+// その半分ほどの速さで、縮み方も劣った。XPRESS_HUFF はよく縮む（42% / 25%）が、
+// 伸長が半分の速さになる（読むたびに伸長するので、こちらを重く見た）。
+
+#define COLD_SEC       5                   // これだけ書かれていなければ圧縮する
+#define COMP_MAX       (BLK_SIZE * 3 / 4)  // これより大きくなるなら圧縮しない
+#define TICK_INCOMP    0x7fffffff          // g_blkTick: 縮まなかった（次に書かれるまで試さない）
+#define NO_BLK         (~0ULL)
+#define FMT_XPRESS     3                   // COMPRESSION_FORMAT_XPRESS
+
+typedef LONG (NTAPI *RtlCompressBuffer_t)(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, ULONG, PULONG, PVOID);
+typedef LONG (NTAPI *RtlDecompressBufferEx_t)(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, PULONG, PVOID);
+typedef LONG (NTAPI *RtlGetCompressionWorkSpaceSize_t)(USHORT, PULONG, PULONG);
+typedef struct { ULONG size; BYTE data[]; } CompBlk;
+
+static RtlCompressBuffer_t     p_compress;
+static RtlDecompressBufferEx_t p_decompress;
+static ULONG           g_cwsSize;          // 圧縮・伸長の作業領域の大きさ
+static BOOL            g_compress;         // 今のディスクで圧縮しているか
+static CompBlk       **g_comp;             // BLK_COMP のブロックの中身
+static LONG           *g_blkTick;          // ブロックに最後に書いた時刻（秒）か TICK_INCOMP
+static volatile LONG   g_now;              // 今の時刻（秒）。圧縮スレッドが進める
+static HANDLE          g_heap;             // 圧縮した中身の置き場
+static void           *g_dws;              // 伸長の作業領域（g_storeLock の中で使う）
+static BYTE           *g_cache;            // 直前に伸長したブロック（g_storeLock の中で使う）
+static ULONGLONG       g_cacheBlk = NO_BLK;
+static volatile LONG64 g_compBlk, g_compBytes;
+static BOOL            g_unpackWarned;
+static HANDLE          g_compThread, g_compStop;
+
+// 確保しているメモリ（そのまま置いている分 + 圧縮して置いている分）
+static ULONGLONG mem_bytes(void) {
+    return ((ULONGLONG)g_usedBlk << BLK_SHIFT) + (ULONGLONG)g_compBytes;
+}
+
+// ディスクの中身として持っている量（圧縮前の大きさ）
+static ULONGLONG data_bytes(void) {
+    return (ULONGLONG)(g_usedBlk + g_compBlk) << BLK_SHIFT;
+}
 
 static BOOL is_zero(const BYTE *p, size_t n) {
     const ULONGLONG *q = (const ULONGLONG *)p;
@@ -277,7 +351,7 @@ static BOOL is_zero(const BYTE *p, size_t n) {
 // 256MB 刻みで上げ下げして、システムコールは境目をまたいだときだけにする。
 static void ws_adjust(void) {
     const ULONGLONG step = 256ULL << 20;
-    ULONGLONG need = ((ULONGLONG)g_usedBlk << BLK_SHIFT) + (64ULL << 20);
+    ULONGLONG need = mem_bytes() + (64ULL << 20);
     if (need <= g_wsMin && need + 2 * step > g_wsMin) return;
     ULONGLONG want = (need + step - 1) / step * step;
     if (want == g_wsMin) return;
@@ -296,13 +370,72 @@ static void ws_adjust(void) {
 // 3,853 MB/s → 1,909 MB/s と半分に落ちたのでやめた（普通にページフォルトさせる方が速い）。
 static BOOL blk_commit(ULONGLONG b) {
     if (!VirtualAlloc(g_base + (b << BLK_SHIFT), BLK_SIZE, MEM_COMMIT, PAGE_READWRITE)) return FALSE;
-    g_bmap[b] = 1;
+    g_bmap[b] = BLK_RAW;
+    InterlockedIncrement64(&g_usedBlk);
+    ws_adjust();
+    return TRUE;
+}
+
+// 書いた印: 回収の世代と、圧縮の時刻
+static void blk_touch(ULONGLONG b) {
+    g_blkGen[b] = g_gen;
+    if (g_blkTick) g_blkTick[b] = g_now;
+}
+
+// 圧縮した中身を捨てる（g_bmap は呼ぶ側が決める）
+static void comp_release(ULONGLONG b) {
+    CompBlk *c = g_comp[b];
+    InterlockedAdd64(&g_compBytes, -(LONG64)(sizeof *c + c->size));
+    InterlockedDecrement64(&g_compBlk);
+    HeapFree(g_heap, 0, c);
+    g_comp[b] = NULL;
+    if (g_cacheBlk == b) g_cacheBlk = NO_BLK;
+}
+
+// 圧縮したブロックを dst（64KB）へ伸長する
+static void comp_unpack(ULONGLONG b, BYTE *dst) {
+    if (g_cacheBlk == b) {
+        memcpy(dst, g_cache, BLK_SIZE);
+        return;
+    }
+    const CompBlk *c = g_comp[b];
+    ULONG got = 0;
+    LONG st = p_decompress(FMT_XPRESS, dst, (ULONG)BLK_SIZE, (PUCHAR)c->data, c->size, &got, g_dws);
+    if (st < 0 || got != BLK_SIZE) {       // 起こらないはずだが、起きたら記録に残す
+        if (!g_unpackWarned) applog(L"ブロック %llu を伸長できなかった（状態 0x%08lx、%lu バイト）", b, (ULONG)st, got);
+        g_unpackWarned = TRUE;
+        if (st < 0) got = 0;
+        if (got < BLK_SIZE) memset(dst + got, 0, (size_t)(BLK_SIZE - got));
+    }
+}
+
+// 読むための伸長。直前に伸長したブロックなら伸長し直さない
+static const BYTE *comp_view(ULONGLONG b) {
+    if (g_cacheBlk != b) {
+        g_cacheBlk = NO_BLK;
+        comp_unpack(b, g_cache);
+        g_cacheBlk = b;
+    }
+    return g_cache;
+}
+
+// 圧縮したブロックを、書き換えるためにアドレス空間へ戻す
+static BOOL blk_promote(ULONGLONG b) {
+    if (!VirtualAlloc(g_base + (b << BLK_SHIFT), BLK_SIZE, MEM_COMMIT, PAGE_READWRITE)) return FALSE;
+    comp_unpack(b, g_base + (b << BLK_SHIFT));
+    comp_release(b);
+    g_bmap[b] = BLK_RAW;
     InterlockedIncrement64(&g_usedBlk);
     ws_adjust();
     return TRUE;
 }
 
 static void blk_free(ULONGLONG b) {
+    if (g_bmap[b] == BLK_COMP) {
+        comp_release(b);
+        g_bmap[b] = 0;
+        return;
+    }
     void *a = g_base + (b << BLK_SHIFT);
     if (!VirtualFree(a, BLK_SIZE, MEM_DECOMMIT)) {
         memset(a, 0, BLK_SIZE);            // 返せないなら 0 で埋めて確保済みのまま置く
@@ -316,8 +449,9 @@ static void store_read(ULONGLONG off, BYTE *dst, ULONGLONG len) {
     while (len) {
         ULONGLONG b = off >> BLK_SHIFT, n = BLK_SIZE - (off & BLK_MASK);
         if (n > len) n = len;
-        if (g_bmap[b]) memcpy(dst, g_base + off, n);
-        else           memset(dst, 0, n);
+        if (g_bmap[b] == BLK_RAW)       memcpy(dst, g_base + off, n);
+        else if (g_bmap[b] == BLK_COMP) memcpy(dst, comp_view(b) + (off & BLK_MASK), n);
+        else                            memset(dst, 0, n);
         off += n; dst += n; len -= n;
     }
 }
@@ -327,17 +461,25 @@ static ULONGLONG store_write(ULONGLONG off, const BYTE *src, ULONGLONG len) {
     while (len) {
         ULONGLONG b = off >> BLK_SHIFT, n = BLK_SIZE - (off & BLK_MASK);
         if (n > len) n = len;
+        if (g_bmap[b] == BLK_COMP) {
+            if (n == BLK_SIZE) {           // まるごと書き換えるなら、伸長せずに捨てる
+                blk_free(b);
+                shrank = TRUE;
+            } else if (!blk_promote(b)) {
+                return 28;                 // ENOSPC
+            }
+        }
         if (!g_bmap[b]) {
             if (!is_zero(src, n)) {        // 0 を書くだけなら確保しない（読めば 0 が返る）
                 if (!blk_commit(b)) return 28;   // ENOSPC
-                g_blkGen[b] = g_gen;
+                blk_touch(b);
                 memcpy(g_base + off, src, n);
             }
         } else if (n == BLK_SIZE && is_zero(src, n)) {
             blk_free(b);                   // ブロックまるごと 0 で上書きされたら返す
             shrank = TRUE;
         } else {
-            g_blkGen[b] = g_gen;
+            blk_touch(b);
             memcpy(g_base + off, src, n);
         }
         off += n; src += n; len -= n;
@@ -346,10 +488,12 @@ static ULONGLONG store_write(ULONGLONG off, const BYTE *src, ULONGLONG len) {
     return 0;
 }
 
-static void store_discard(ULONGLONG off, ULONGLONG len) {
-    if (off >= g_diskSize) return;
+// TRIM・ZERO。読めば 0 が返るようにする（ZERO は書き込みなので、できなければ失敗を返す）
+static ULONGLONG store_discard(ULONGLONG off, ULONGLONG len) {
+    if (off >= g_diskSize) return 0;
     if (len > g_diskSize - off) len = g_diskSize - off;
     BOOL shrank = FALSE;
+    ULONGLONG err = 0;
     while (len) {
         ULONGLONG b = off >> BLK_SHIFT, n = BLK_SIZE - (off & BLK_MASK);
         if (n > len) n = len;
@@ -357,29 +501,170 @@ static void store_discard(ULONGLONG off, ULONGLONG len) {
             if (n == BLK_SIZE) {
                 blk_free(b);
                 shrank = TRUE;
+            } else if (g_bmap[b] == BLK_COMP && !blk_promote(b)) {
+                err = 28;                  // ENOSPC
             } else {
                 memset(g_base + off, 0, n);
                 if (is_zero(g_base + (b << BLK_SHIFT), BLK_SIZE)) { blk_free(b); shrank = TRUE; }
-                else g_blkGen[b] = g_gen;
+                else blk_touch(b);
             }
             if (!g_bmap[b]) InterlockedIncrement64(&g_stTrimFreed);
         }
         off += n; len -= n;
     }
     if (shrank) ws_adjust();
+    return err;
 }
 
-static BOOL store_init(ULONGLONG size) {
+// ---- 圧縮スレッド ----
+
+// 1 ブロックを圧縮して置き換える。置き換えたら TRUE
+static BOOL compress_block(ULONGLONG b, LONG tick, BYTE *raw, BYTE *out, void *ws) {
+    AcquireSRWLockExclusive(&g_storeLock);
+    BOOL same = g_bmap[b] == BLK_RAW && g_blkTick[b] == tick;
+    if (same) memcpy(raw, g_base + (b << BLK_SHIFT), BLK_SIZE);
+    ReleaseSRWLockExclusive(&g_storeLock);
+    if (!same) return FALSE;
+
+    BOOL zero = is_zero(raw, BLK_SIZE);
+    ULONG cs = 0;
+    // 出力の枠を COMP_MAX にしておくと、縮まないブロックは途中で打ち切られる
+    BOOL fits = !zero && p_compress(FMT_XPRESS, raw, (ULONG)BLK_SIZE, out, (ULONG)COMP_MAX, 4096, &cs, ws) >= 0 &&
+                cs && cs <= COMP_MAX;
+    CompBlk *c = fits ? HeapAlloc(g_heap, 0, sizeof *c + cs) : NULL;
+    if (c) {
+        c->size = cs;
+        memcpy(c->data, out, cs);
+    }
+
+    BOOL done = FALSE;
+    AcquireSRWLockExclusive(&g_storeLock);
+    if (g_bmap[b] == BLK_RAW && g_blkTick[b] == tick) {   // 写してから書かれていない
+        if (zero) {
+            blk_free(b);                   // 中身が全部 0 なら置かなくてよい
+            done = TRUE;
+        } else if (c) {
+            if (VirtualFree(g_base + (b << BLK_SHIFT), BLK_SIZE, MEM_DECOMMIT)) {
+                g_comp[b] = c;
+                c = NULL;
+                g_bmap[b] = BLK_COMP;
+                InterlockedDecrement64(&g_usedBlk);
+                InterlockedIncrement64(&g_compBlk);
+                InterlockedAdd64(&g_compBytes, (LONG64)(sizeof *g_comp[b] + cs));
+                done = TRUE;
+            }
+        } else if (!fits) {
+            g_blkTick[b] = TICK_INCOMP;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_storeLock);
+    if (c) HeapFree(g_heap, 0, c);
+    return done;
+}
+
+static DWORD WINAPI compress_main(LPVOID unused) {
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    BYTE *raw = VirtualAlloc(NULL, 2 * BLK_SIZE, MEM_COMMIT, PAGE_READWRITE);
+    void *ws = malloc(g_cwsSize);
+    if (!raw || !ws) {
+        applog(L"圧縮スレッドの作業領域を確保できなかった");
+        free(ws);
+        return 1;
+    }
+    BYTE *out = raw + BLK_SIZE;
+    LONGLONG lastBytes = g_compBytes;
+    while (WaitForSingleObject(g_compStop, 1000) == WAIT_TIMEOUT) {
+        LONG now = g_now = (LONG)(GetTickCount64() / 1000);
+        ULONGLONG changed = 0, tried = 0;
+        for (ULONGLONG b = 0; b < g_nblk; b++) {
+            if (g_bmap[b] != BLK_RAW) continue;   // ロックの外での下見（確かめ直すのは compress_block）
+            LONG t = g_blkTick[b];
+            if (t == TICK_INCOMP || now - t < COLD_SEC) continue;
+            if (compress_block(b, t, raw, out, ws)) changed++;
+            if (++tried % 64 == 0 && WaitForSingleObject(g_compStop, 0) == WAIT_OBJECT_0) break;
+        }
+        if (changed) {
+            AcquireSRWLockExclusive(&g_storeLock);
+            ws_adjust();
+            ReleaseSRWLockExclusive(&g_storeLock);
+        }
+        // 圧縮した中身がまとまって消えたら、ヒープの空きを OS へ返させる
+        if (g_compBytes + (64LL << 20) < lastBytes) HeapCompact(g_heap, 0);
+        if (g_compBytes < lastBytes || changed) lastBytes = g_compBytes;
+    }
+    VirtualFree(raw, 0, MEM_RELEASE);
+    free(ws);
+    return 0;
+}
+
+static BOOL compress_init(void) {
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    p_compress = (RtlCompressBuffer_t)(void *)GetProcAddress(nt, "RtlCompressBuffer");
+    p_decompress = (RtlDecompressBufferEx_t)(void *)GetProcAddress(nt, "RtlDecompressBufferEx");
+    RtlGetCompressionWorkSpaceSize_t wsz =
+        (RtlGetCompressionWorkSpaceSize_t)(void *)GetProcAddress(nt, "RtlGetCompressionWorkSpaceSize");
+    ULONG a = 0, f = 0;
+    if (!p_compress || !p_decompress || !wsz || wsz(FMT_XPRESS, &a, &f) < 0) return FALSE;
+    g_cwsSize = (a > f ? a : f) + 64;
+    g_comp = calloc((size_t)g_nblk, sizeof *g_comp);
+    g_blkTick = calloc((size_t)g_nblk, sizeof(LONG));
+    g_heap = HeapCreate(0, 0, 0);
+    g_dws = malloc(g_cwsSize);
+    g_cache = VirtualAlloc(NULL, BLK_SIZE, MEM_COMMIT, PAGE_READWRITE);
+    g_cacheBlk = NO_BLK;
+    g_now = (LONG)(GetTickCount64() / 1000);
+    g_compStop = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_comp || !g_blkTick || !g_heap || !g_dws || !g_cache || !g_compStop) return FALSE;
+    g_compThread = CreateThread(NULL, 0, compress_main, NULL, 0, NULL);
+    return g_compThread != NULL;
+}
+
+static void compress_free(void) {
+    if (g_compThread) {
+        SetEvent(g_compStop);
+        WaitForSingleObject(g_compThread, INFINITE);   // 止めてからでないと表を消せない
+        CloseHandle(g_compThread);
+        g_compThread = NULL;
+    }
+    if (g_compStop) CloseHandle(g_compStop);
+    if (g_heap) HeapDestroy(g_heap);
+    if (g_cache) VirtualFree(g_cache, 0, MEM_RELEASE);
+    free(g_comp);
+    free(g_blkTick);
+    free(g_dws);
+    g_compStop = g_heap = NULL;
+    g_comp = NULL;
+    g_blkTick = NULL;
+    g_dws = NULL;
+    g_cache = NULL;
+    g_cacheBlk = NO_BLK;
+    g_compBlk = g_compBytes = 0;
+    g_compress = FALSE;
+}
+
+static BOOL store_init(ULONGLONG size, BOOL compress) {
     g_diskSize = size;
     g_nblk = (size + BLK_MASK) >> BLK_SHIFT;
     g_base = VirtualAlloc(NULL, g_nblk << BLK_SHIFT, MEM_RESERVE, PAGE_READWRITE);
     g_bmap = calloc((size_t)g_nblk, 1);
     g_blkGen = calloc((size_t)g_nblk, sizeof(LONG));
     g_usedBlk = g_stTrimReq = g_stTrimBytes = g_stTrimFreed = g_stReclaimed = 0;
-    return g_base && g_bmap && g_blkGen;
+    g_compBlk = g_compBytes = 0;
+    g_unpackWarned = FALSE;
+    if (!g_base || !g_bmap || !g_blkGen) return FALSE;
+    if (compress) {
+        g_compress = compress_init();
+        if (!g_compress) {
+            applog(L"圧縮の準備ができなかったので、圧縮せずに続ける");
+            compress_free();
+        }
+    }
+    return TRUE;
 }
 
 static void store_free(void) {
+    compress_free();                       // 圧縮スレッドが表を見ているので先に止める
     if (g_base) VirtualFree(g_base, 0, MEM_RELEASE);
     free(g_bmap);
     free(g_blkGen);
@@ -432,12 +717,13 @@ static void proxy_handle(void) {
         if (q.length > PROXY_BUFFER_SIZE) items = 0;
         const DATA_SET_RANGE *rg = (const DATA_SET_RANGE *)data;
         InterlockedIncrement64(&g_stTrimReq);
+        PROXY_UNMAP_RESP r = { 0 };
         for (ULONGLONG i = 0; i < items; i++)
             if (rg[i].StartingOffset >= 0) {
-                store_discard((ULONGLONG)rg[i].StartingOffset, rg[i].LengthInBytes);
+                ULONGLONG e = store_discard((ULONGLONG)rg[i].StartingOffset, rg[i].LengthInBytes);
+                if (e) r.errorno = e;
                 InterlockedAdd64(&g_stTrimBytes, (LONG64)rg[i].LengthInBytes);
             }
-        PROXY_UNMAP_RESP r = { 0 };
         memcpy(hdr, &r, sizeof r);
         break;
     }
@@ -485,11 +771,11 @@ static void proxy_close(void) {
     store_free();
 }
 
-static BOOL proxy_open(ULONGLONG size) {
+static BOOL proxy_open(ULONGLONG size, BOOL compress) {
     wchar_t name[96];
     g_proxyStop = 0;
     swprintf(g_objName, ARRAYSIZE(g_objName), L"RamDay_%lu", GetCurrentProcessId());
-    if (!store_init(size)) return FALSE;
+    if (!store_init(size, compress)) return FALSE;
     swprintf(name, ARRAYSIZE(name), L"Global\\%ls", g_objName);
     g_shmMap = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
                                   PROXY_HEADER_SIZE + PROXY_BUFFER_SIZE, name);
@@ -762,8 +1048,8 @@ static void remove_letter_leftovers(wchar_t letter) {
     RegDeleteTreeW(HKEY_CURRENT_USER, key);
 }
 
-static BOOL disk_create(wchar_t letter, ULONGLONG size, DWORD *err) {
-    if (!proxy_open(size)) {
+static BOOL disk_create(wchar_t letter, ULONGLONG size, BOOL compress, DWORD *err) {
+    if (!proxy_open(size, compress)) {
         *err = GetLastError();
         proxy_close();
         return FALSE;
@@ -798,7 +1084,8 @@ static BOOL disk_create(wchar_t letter, ULONGLONG size, DWORD *err) {
     g_diskUp = TRUE;
     ini_put_int(L"Backup", L"DeviceNumber", g_devNum);
     ini_flush();
-    applog(L"デバイス \\Device\\ImDisk%lu を作成した（%lc:、最大 %llu バイト）", g_devNum, letter, size);
+    applog(L"デバイス \\Device\\ImDisk%lu を作成した（%lc:、最大 %llu バイト、圧縮%ls）", g_devNum, letter, size,
+           g_compress ? L"する" : L"しない");
     return TRUE;
 }
 
@@ -926,7 +1213,7 @@ static ULONGLONG reclaim_once(void) {
     if (!GetDiskFreeSpaceW(root, &spc, &bps, &fc, &tc)) return 0;
     ULONGLONG cl = (ULONGLONG)spc * bps;
     ULONGLONG fsUsed = (ULONGLONG)(tc - fc) * cl;
-    ULONGLONG used = (ULONGLONG)g_usedBlk << BLK_SHIFT;
+    ULONGLONG used = data_bytes();
     if (used <= fsUsed + (8ULL << 20)) return 0;      // 余分が小さいうちは読まない
 
     HANDLE h = CreateFileW(vol, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
@@ -1010,8 +1297,10 @@ static void reclaim_stop(void) {
 }
 
 static void log_stats(const wchar_t *when) {
-    applog(L"%ls: 確保 %llu MB / TRIM・ZERO 要求 %lld 件（%lld MB、返したブロック %lld）/ 回収で返したブロック %lld",
-           when, ((ULONGLONG)g_usedBlk << BLK_SHIFT) >> 20, g_stTrimReq, g_stTrimBytes >> 20, g_stTrimFreed, g_stReclaimed);
+    applog(L"%ls: 確保 %llu MB（中身 %llu MB、うち圧縮 %lld ブロックを %lld MB に）/ TRIM・ZERO 要求 %lld 件"
+           L"（%lld MB、返したブロック %lld）/ 回収で返したブロック %lld",
+           when, mem_bytes() >> 20, data_bytes() >> 20, g_compBlk, g_compBytes >> 20,
+           g_stTrimReq, g_stTrimBytes >> 20, g_stTrimFreed, g_stReclaimed);
 }
 
 // ---- TEMP / TMP 環境変数 ----
@@ -1155,7 +1444,9 @@ typedef struct {
     ULONGLONG wnd;
     LONG      fs, tempOn;
     WCHAR     letter, pad[3];
-    ULONGLONG diskSize, used;
+    ULONGLONG diskSize, used;              // used: 確保しているメモリ
+    ULONGLONG data;                        // 中身（圧縮前の大きさ）
+    LONG      compress, pad2;
     WCHAR     tempDir[MAX_PATH];
 } SharedStatus;
 #define STATUS_NAME L"Local\\RamDay_Status"
@@ -1193,7 +1484,9 @@ static void status_set(LONG state) {
     g_st->tempOn = g_envChanged;
     wcsncpy(g_st->tempDir, g_cfg.tempDir, MAX_PATH - 1);
     g_st->diskSize = g_diskSize;
-    g_st->used = (ULONGLONG)g_usedBlk << BLK_SHIFT;
+    g_st->used = mem_bytes();
+    g_st->data = data_bytes();
+    g_st->compress = g_compress;
     MemoryBarrier();
     g_st->state = state;
 }
@@ -1254,7 +1547,8 @@ static BOOL start_all(const Settings *s) {
     ULONGLONG size = cfg_bytes(s);
     wchar_t sz[32];
     format_bytes(size, sz, ARRAYSIZE(sz));
-    applog(L"開始: %lc: 最大 %ls %ls TEMP=%ls", s->letter, sz, FS_NAMES[s->fs], s->temp ? s->tempDir : L"（切り替えない）");
+    applog(L"開始: %lc: 最大 %ls %ls 圧縮=%ls TEMP=%ls", s->letter, sz, FS_NAMES[s->fs], s->compress ? L"する" : L"しない",
+           s->temp ? s->tempDir : L"（切り替えない）");
     if (GetLogicalDrives() & (1u << (s->letter - L'A'))) {
         wchar_t m[128];
         swprintf(m, ARRAYSIZE(m), L"%lc: はすでに使われています。別のドライブ文字を選んでください。", s->letter);
@@ -1277,7 +1571,7 @@ static BOOL start_all(const Settings *s) {
             fail_msg(NULL, L"ImDisk ドライバを読み込めませんでした。", err);
         goto fail;
     }
-    if (!disk_create(s->letter, size, &err)) {
+    if (!disk_create(s->letter, size, s->compress, &err)) {
         fail_msg(NULL, L"RAM ディスクを作成できませんでした。", err);
         goto fail;
     }
@@ -1347,7 +1641,8 @@ static const wchar_t *cmdline_args(void) {
 
 static void worker_args(const Settings *s, wchar_t *buf, size_t n) {
     wchar_t tmp[MAX_PATH + 64];
-    swprintf(buf, n, L"-worker -d %lc -s %llu%ls -fs %ls", s->letter, s->sizeNum, s->unitGB ? L"G" : L"M", FS_NAMES[s->fs]);
+    swprintf(buf, n, L"-worker -d %lc -s %llu%ls -fs %ls%ls", s->letter, s->sizeNum, s->unitGB ? L"G" : L"M", FS_NAMES[s->fs],
+             s->compress ? L" -compress" : L"");
     if (s->temp && (s->tempUser || s->tempSys)) {
         swprintf(tmp, ARRAYSIZE(tmp), L" -temp \"%ls\" -scope %ls", s->tempDir,
                  s->tempUser && s->tempSys ? L"both" : s->tempUser ? L"user" : L"system");
@@ -1404,6 +1699,7 @@ static void dlg_show_settings(HWND dlg, const Settings *c, wchar_t include) {
     SetDlgItemInt(dlg, IDC_SIZE_EDIT, (UINT)c->sizeNum, FALSE);
     SendDlgItemMessageW(dlg, IDC_UNIT, CB_SETCURSEL, c->unitGB ? 1 : 0, 0);
     SendDlgItemMessageW(dlg, IDC_FS, CB_SETCURSEL, c->fs, 0);
+    CheckDlgButton(dlg, IDC_COMPRESS, c->compress ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(dlg, IDC_TEMP_ON, c->temp ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(dlg, IDC_TEMP_USER, c->tempUser ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(dlg, IDC_TEMP_SYS, c->tempSys ? BST_CHECKED : BST_UNCHECKED);
@@ -1416,6 +1712,7 @@ static void settings_from_status(const SharedStatus *st, Settings *c) {
     *c = g_cfg;
     c->letter = st->letter;
     c->fs = (st->fs >= 0 && st->fs < FS_COUNT) ? st->fs : FS_NTFS;
+    c->compress = st->compress;
     BOOL gb = st->diskSize && !(st->diskSize & ((1ULL << 30) - 1));
     c->unitGB = gb;
     c->sizeNum = st->diskSize >> (gb ? 30 : 20);
@@ -1429,7 +1726,7 @@ static void settings_from_status(const SharedStatus *st, Settings *c) {
 
 // 入力欄の有効・無効。動いている間は設定を変えられない
 static void dlg_update_enable(HWND dlg, BOOL editable) {
-    static const int fields[] = { IDC_DRIVE, IDC_SIZE_EDIT, IDC_UNIT, IDC_FS, IDC_TEMP_ON };
+    static const int fields[] = { IDC_DRIVE, IDC_SIZE_EDIT, IDC_UNIT, IDC_FS, IDC_COMPRESS, IDC_TEMP_ON };
     for (size_t i = 0; i < ARRAYSIZE(fields); i++) EnableWindow(GetDlgItem(dlg, fields[i]), editable);
     BOOL on = editable && IsDlgButtonChecked(dlg, IDC_TEMP_ON) == BST_CHECKED;
     EnableWindow(GetDlgItem(dlg, IDC_TEMP_DIR), on);
@@ -1468,15 +1765,17 @@ static void ui_refresh(HWND dlg) {
         }
     }
 
-    wchar_t text[300], u[32], mx[32];
+    wchar_t text[300], u[80], mx[32];
     switch (state) {
     case ST_STARTING: wcscpy(text, L"開始しています…"); break;
     case ST_STOPPING: wcscpy(text, L"終了しています…"); break;
     case ST_RUNNING:
-        format_bytes(st.used, u, ARRAYSIZE(u));
+        format_usage(st.used, st.data, st.compress, u, ARRAYSIZE(u));
         format_bytes(st.diskSize, mx, ARRAYSIZE(mx));
-        swprintf(text, ARRAYSIZE(text), L"動作中 — %lc:（%ls）　メモリ使用 %ls / 最大 %ls",
-                 st.letter, (st.fs >= 0 && st.fs < FS_COUNT) ? FS_NAMES[st.fs] : L"?", u, mx);
+        // 圧縮していると長くなるので、「使用」を省いて 1 行に収める
+        swprintf(text, ARRAYSIZE(text), L"動作中 — %lc:（%ls）　メモリ%ls %ls / 最大 %ls",
+                 st.letter, (st.fs >= 0 && st.fs < FS_COUNT) ? FS_NAMES[st.fs] : L"?",
+                 st.compress ? L"" : L"使用", u, mx);
         break;
     default: wcscpy(text, L"停止中"); break;
     }
@@ -1515,6 +1814,7 @@ static BOOL dlg_collect(HWND dlg, Settings *out) {
     s.sizeNum = GetDlgItemInt(dlg, IDC_SIZE_EDIT, &ok, FALSE);
     s.unitGB = SendDlgItemMessageW(dlg, IDC_UNIT, CB_GETCURSEL, 0, 0) == 1;
     s.fs = (int)SendDlgItemMessageW(dlg, IDC_FS, CB_GETCURSEL, 0, 0);
+    s.compress = IsDlgButtonChecked(dlg, IDC_COMPRESS) == BST_CHECKED;
     s.temp = IsDlgButtonChecked(dlg, IDC_TEMP_ON) == BST_CHECKED;
     s.tempUser = IsDlgButtonChecked(dlg, IDC_TEMP_USER) == BST_CHECKED;
     s.tempSys = IsDlgButtonChecked(dlg, IDC_TEMP_SYS) == BST_CHECKED;
@@ -1661,13 +1961,13 @@ static int ui_main(void) {
 
 // ---- タスクトレイ（ワーカー） ----
 
-static ULONGLONG used_bytes(void) {
-    return (ULONGLONG)g_usedBlk << BLK_SHIFT;
+static void usage_text(wchar_t *buf, size_t n) {
+    format_usage(mem_bytes(), data_bytes(), g_compress, buf, n);
 }
 
 static void update_tip(void) {
-    wchar_t u[32], mx[32];
-    format_bytes(used_bytes(), u, ARRAYSIZE(u));
+    wchar_t u[80], mx[32];
+    usage_text(u, ARRAYSIZE(u));
     format_bytes(g_diskSize, mx, ARRAYSIZE(mx));
     swprintf(g_nid.szTip, ARRAYSIZE(g_nid.szTip), L"RamDay %lc:  メモリ使用 %ls / 最大 %ls", g_cfg.letter, u, mx);
     g_nid.uFlags = NIF_TIP | NIF_SHOWTIP;
@@ -1701,8 +2001,8 @@ static void open_settings(void) {
 }
 
 static void show_status(void) {
-    wchar_t u[32], mx[32], fu[32] = L"?", text[1200], du[600], ds[600];
-    format_bytes(used_bytes(), u, ARRAYSIZE(u));
+    wchar_t u[32], mx[32], fu[32] = L"?", text[1400], du[600], ds[600], cp[200] = L"しない";
+    format_bytes(mem_bytes(), u, ARRAYSIZE(u));
     format_bytes(g_diskSize, mx, ARRAYSIZE(mx));
     wchar_t root[] = L" :\\";
     root[0] = g_cfg.letter;
@@ -1711,17 +2011,24 @@ static void show_status(void) {
         format_bytes(total.QuadPart - freeb.QuadPart, fu, ARRAYSIZE(fu));
     env_describe(FALSE, du, ARRAYSIZE(du));
     env_describe(TRUE, ds, ARRAYSIZE(ds));
+    if (g_compress) {
+        wchar_t dd[32], cr[32], cc[32];
+        format_bytes(data_bytes(), dd, ARRAYSIZE(dd));
+        format_bytes((ULONGLONG)g_compBlk << BLK_SHIFT, cr, ARRAYSIZE(cr));
+        format_bytes((ULONGLONG)g_compBytes, cc, ARRAYSIZE(cc));
+        swprintf(cp, ARRAYSIZE(cp), L"する（圧縮前 %ls のうち %ls を %ls に圧縮）", dd, cr, cc);
+    }
     swprintf(text, ARRAYSIZE(text),
-             L"ドライブ: %lc:（%ls）\n最大容量: %ls\n確保しているメモリ: %ls\nファイルシステム上の使用量: %ls\n\n"
-             L"TEMP の今の値\n  %ls\n  %ls",
-             g_cfg.letter, FS_NAMES[g_cfg.fs], mx, u, fu, du, ds);
+             L"ドライブ: %lc:（%ls）\n最大容量: %ls\n確保しているメモリ: %ls\nメモリ上の圧縮: %ls\n"
+             L"ファイルシステム上の使用量: %ls\n\nTEMP の今の値\n  %ls\n  %ls",
+             g_cfg.letter, FS_NAMES[g_cfg.fs], mx, u, cp, fu, du, ds);
     MessageBoxW(g_wnd, text, APP_TITLE, MB_ICONINFORMATION);
 }
 
 static void show_menu(void) {
     HMENU m = CreatePopupMenu();
-    wchar_t st[128], u[32], mx[32], op[32];
-    format_bytes(used_bytes(), u, ARRAYSIZE(u));
+    wchar_t st[160], u[80], mx[32], op[32];
+    usage_text(u, ARRAYSIZE(u));
     format_bytes(g_diskSize, mx, ARRAYSIZE(mx));
     swprintf(st, ARRAYSIZE(st), L"%lc: メモリ使用 %ls / 最大 %ls ...", g_cfg.letter, u, mx);
     swprintf(op, ARRAYSIZE(op), L"%lc: を開く", g_cfg.letter);
@@ -1981,7 +2288,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
 
     settings_load(&g_cfg);
     BOOL cli = FALSE, worker = FALSE, doRelease = FALSE, force = FALSE, doRestore = FALSE, tempGiven = FALSE;
-    BOOL doStart = FALSE;
+    BOOL doStart = FALSE, compressGiven = FALSE;
     int argc;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; argv && i < argc; i++) {
@@ -1996,6 +2303,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
         else if (!_wcsicmp(a, L"verbose")) g_verbose = TRUE;
         else if (!_wcsicmp(a, L"start")) doStart = TRUE;
         else if (!_wcsicmp(a, L"notemp")) { g_cfg.temp = FALSE; cli = TRUE; }
+        else if (!_wcsicmp(a, L"compress")) { g_cfg.compress = compressGiven = TRUE; cli = TRUE; }
         else if (!_wcsicmp(a, L"d") && has) { g_cfg.letter = towupper(argv[++i][0]); cli = TRUE; }
         else if (!_wcsicmp(a, L"s") && has) {
             if (!parse_size(argv[++i], &g_cfg)) { fail_msg(NULL, L"-s の値が読めません（例: -s 4G、-s 512M）", 0); return 1; }
@@ -2017,6 +2325,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
     }
     if (argv) LocalFree(argv);
     if (cli && !tempGiven) swprintf(g_cfg.tempDir, MAX_PATH, L"%lc:\\Temp", g_cfg.letter);
+    if (cli && !compressGiven) g_cfg.compress = FALSE;   // コマンドラインでは -compress を付けたときだけ圧縮する
 
     if (doRelease) return release_running(force);   // ワーカーが受け付けるので管理者は要らない
 
